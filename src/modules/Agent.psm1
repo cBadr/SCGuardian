@@ -15,7 +15,7 @@ Import-Module (Join-Path $PSScriptRoot 'Common.psm1') -Force -DisableNameCheckin
 Import-Module (Join-Path $PSScriptRoot 'Discovery.psm1') -Force -DisableNameChecking
 Import-Module (Join-Path $PSScriptRoot 'Hardening.psm1') -Force -DisableNameChecking
 
-$script:AgentVersion = '4.0.1'
+$script:AgentVersion = '4.0.2'
 $script:ProcessStartUtc = [datetime]::UtcNow
 $script:PinWarned = $false
 $script:ValidLayer = @('Recovery', 'FolderAcl', 'ServiceSd', 'RegistryAcl')

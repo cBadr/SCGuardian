@@ -77,11 +77,28 @@ foreach ($p in @('modules', 'lib', 'SCGuardian.ps1', 'config\hub.config.template
 }
 
 if ($PSCmdlet.ShouldProcess($InstallDir, 'Copy program files')) {
+    # A running Hub task has lib\SQLite.Interop.dll loaded natively; overwriting it in place fails
+    # with Access Denied. Stop the task first (no-op if it is not registered yet, e.g. first install)
+    # and retry the copy briefly: Stop-ScheduledTask returns before the process has fully exited and
+    # released the file handle.
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
     foreach ($d in @('modules', 'lib')) {
         $dest = Join-Path $InstallDir $d
-        if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
-        Copy-Item -LiteralPath (Join-Path $srcDir $d) -Destination $dest -Recurse -Force
+        $src = Join-Path $srcDir $d
+        $attempt = 0
+        while ($true) {
+            $attempt++
+            try {
+                if (Test-Path -LiteralPath $dest) { Remove-Item -LiteralPath $dest -Recurse -Force }
+                Copy-Item -LiteralPath $src -Destination $dest -Recurse -Force
+                break
+            }
+            catch {
+                if ($attempt -ge 10) { throw "Cannot replace $dest (still in use by a running SCGuardian-Hub process): $($_.Exception.Message)" }
+                Start-Sleep -Milliseconds 500
+            }
+        }
     }
     Copy-Item -LiteralPath (Join-Path $srcDir 'SCGuardian.ps1') -Destination (Join-Path $InstallDir 'SCGuardian.ps1') -Force
 }

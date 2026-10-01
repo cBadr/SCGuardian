@@ -35,7 +35,39 @@ BeforeAll {
     function Register-TestDevice {
         param([string]$Name = 'PC-01')
         $r = Invoke-ScgEnroll -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = $Name; os = 'Windows'; os_version = '10.0'; agent_version = '4.0.0' }) -RemoteIp '10.0.0.5'
+        $script:Tokens[[string]$r.Body.device_id] = [string]$r.Body.device_token
         $r.Body.device_id
+    }
+    function Get-TestAuth {
+        param($Body)
+        $h = @{}
+        if ($null -eq $Body -or -not $Body.PSObject.Properties['device_id']) { return $h }
+        $id = [string]$Body.device_id
+        if ($script:Tokens.ContainsKey($id)) { $h['X-SCG-Device-Token'] = $script:Tokens[$id] }
+        return $h
+    }
+    function Invoke-TestHeartbeat {
+        param($Body, $Config = $script:Cfg)
+        Invoke-ScgHeartbeat -Config $Config -Body $Body -RemoteIp '10.0.0.5' -Headers (Get-TestAuth $Body)
+    }
+    function Invoke-TestResult {
+        param($Body, $Config = $script:Cfg, [scriptblock]$Send)
+        $p = @{ Config = $Config; Body = $Body; Headers = (Get-TestAuth $Body) }
+        if ($Send) { $p['Send'] = $Send }
+        Invoke-ScgResult @p
+    }
+    function Invoke-TestEvent {
+        param($Body, $Config = $script:Cfg)
+        Invoke-ScgEventIngest -Config $Config -Body $Body -Headers (Get-TestAuth $Body)
+    }
+    function Get-TestRejectReason {
+        @(@(Get-ScgAudit -Path $script:Db -Last 200) | Where-Object { $_.action -eq 'auth.reject' } | ForEach-Object { ($_.meta_json | ConvertFrom-Json).reason })
+    }
+    function Get-TestDeviceHeader {
+        param([string]$Token, [string]$Nonce = ([guid]::NewGuid().ToString()))
+        $h = New-TestHeader -Nonce $Nonce
+        if ($Token) { $h['X-SCG-Device-Token'] = $Token }
+        $h
     }
     function New-TestHeader {
         param([string]$Bearer = $script:Secret, [string]$Nonce = ([guid]::NewGuid().ToString()))
@@ -61,6 +93,7 @@ BeforeAll {
         $script:Db = Join-Path $TestDrive ('t' + [guid]::NewGuid().ToString('N') + '.db')
         [void](Initialize-ScgDatabase -Path $script:Db)
         $script:Cfg = New-TestConfig -Db $script:Db
+        $script:Tokens = @{}
     }
 }
 
@@ -145,32 +178,66 @@ Describe 'Invoke-ScgEnroll' {
         $r.Body.device_id | Should -Not -BeNullOrEmpty
         @(@(Get-ScgAudit -Path $script:Db -Last 10) | Where-Object { $_.action -eq 'enroll' }).Count | Should -Be 1
     }
-    It 'returns the same id on re-enroll of a stale device and audits reenroll' {
-        $a = Register-TestDevice -Name 'PC-01'
-        [void](Invoke-ScgSql -Path $script:Db -NonQuery -Sql 'UPDATE devices SET last_seen=@t WHERE id=@id' -Parameter @{ t = '2020-01-01T00:00:00.000Z'; id = $a })
-        $r = Invoke-ScgEnroll -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; os = 'Windows'; os_version = '10.0'; agent_version = '4.0.1' }) -RemoteIp '10.0.0.6'
+    It 'returns a device token once and stores only its hash' {
+        $r = Invoke-ScgEnroll -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; os = 'Windows'; os_version = '10.0'; agent_version = '4.0.0' }) -RemoteIp '10.0.0.5'
         $r.Status | Should -Be 200
-        $r.Body.device_id | Should -Be $a
-        @(Get-ScgDevice -Path $script:Db).Count | Should -Be 1
-        $enrolls = @(@(Get-ScgAudit -Path $script:Db -Last 20) | Where-Object { $_.action -eq 'enroll' })
-        $enrolls.Count | Should -Be 2
-        ($enrolls[0].meta_json | ConvertFrom-Json).reenroll | Should -BeTrue
-        $first = $enrolls[1].meta_json | ConvertFrom-Json
-        [bool]($first.PSObject.Properties['reenroll']) | Should -BeFalse
+        $tok = [string]$r.Body.device_token
+        $tok | Should -Match '^[A-Za-z0-9_-]{43}$'
+        $row = @(Get-ScgDevice -Path $script:Db -DeviceId $r.Body.device_id)[0]
+        $row.token_hash | Should -BeExactly (Get-ScgTokenHash -Token $tok)
+        $row.token_hash | Should -Not -Be $tok
+        $dump = (@(Invoke-ScgSql -Path $script:Db -Sql 'SELECT * FROM devices') + @(Invoke-ScgSql -Path $script:Db -Sql 'SELECT * FROM audit_log') | ConvertTo-Json -Depth 4 -Compress)
+        $dump.Contains($tok) | Should -BeFalse
+        $script:Tokens[[string]$r.Body.device_id] = $tok
+        $hb = Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $r.Body.device_id; hostname = 'PC-01'; sc_agents = @() })
+        $hb.Status | Should -Be 200
+        (ConvertTo-Json -InputObject $hb.Body -Depth 6 -Compress).Contains($tok) | Should -BeFalse
+        [bool]($hb.Body.Contains('device_token')) | Should -BeFalse
     }
-    It 'answers 409 when the hostname is enrolled and online and audits auth.reject' {
+    It 'answers 409 on re-enroll while a token hash is set, even when the device is stale' {
         $a = Register-TestDevice -Name 'PC-01'
-        $r = Invoke-ScgEnroll -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; os = 'Windows'; os_version = '10.0'; agent_version = '4.0.0' }) -RemoteIp '10.0.0.66'
+        $hash = (@(Get-ScgDevice -Path $script:Db -DeviceId $a))[0].token_hash
+        [void](Invoke-ScgSql -Path $script:Db -NonQuery -Sql 'UPDATE devices SET last_seen=@t WHERE id=@id' -Parameter @{ t = '2020-01-01T00:00:00.000Z'; id = $a })
+        $r = Invoke-ScgEnroll -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; os = 'Windows'; os_version = '10.0'; agent_version = '4.0.1' }) -RemoteIp '10.0.0.66'
         $r.Status | Should -Be 409
         $r.Body.ok | Should -BeFalse
-        $r.Body.error | Should -BeExactly 'hostname already enrolled and online'
+        $r.Body.error | Should -BeExactly 'hostname already enrolled'
+        [bool]($r.Body.Contains('device_token')) | Should -BeFalse
         $rej = @(@(Get-ScgAudit -Path $script:Db -Last 20) | Where-Object { $_.action -eq 'auth.reject' })
         $rej.Count | Should -Be 1
         $m = $rej[0].meta_json | ConvertFrom-Json
         $m.reason | Should -Be 'enroll_conflict'
         $m.hostname | Should -Be 'PC-01'
         @(@(Get-ScgAudit -Path $script:Db -Last 20) | Where-Object { $_.action -eq 'enroll' }).Count | Should -Be 1
-        (@(Get-ScgDevice -Path $script:Db -DeviceId $a))[0].last_ip | Should -Be '10.0.0.5'
+        $row = (@(Get-ScgDevice -Path $script:Db -DeviceId $a))[0]
+        $row.last_ip | Should -Be '10.0.0.5'
+        $row.token_hash | Should -BeExactly $hash
+    }
+    It 're-enrolls after Clear-ScgDeviceToken with the same id and a new token, and the old token then fails' {
+        $a = Register-TestDevice -Name 'PC-01'
+        $old = $script:Tokens[$a]
+        Clear-ScgDeviceToken -Path $script:Db -DeviceId $a | Should -BeTrue
+        $hbBody = ConvertTo-TestBody @{ device_id = $a; hostname = 'PC-01'; sc_agents = @() }
+        $nr = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hbBody -Headers @{ 'X-SCG-Device-Token' = $old }
+        $nr.Status | Should -Be 401
+        $nr.Body.error | Should -BeExactly 'device not enrolled'
+        Get-TestRejectReason | Should -Contain 'device_not_enrolled'
+        $r = Invoke-ScgEnroll -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; os = 'Windows'; os_version = '10.0'; agent_version = '4.0.1' }) -RemoteIp '10.0.0.6'
+        $r.Status | Should -Be 200
+        $r.Body.device_id | Should -Be $a
+        $new = [string]$r.Body.device_token
+        $new | Should -Not -BeNullOrEmpty
+        $new | Should -Not -Be $old
+        @(Get-ScgDevice -Path $script:Db).Count | Should -Be 1
+        (@(Get-ScgDevice -Path $script:Db -DeviceId $a))[0].token_hash | Should -BeExactly (Get-ScgTokenHash -Token $new)
+        $enrolls = @(@(Get-ScgAudit -Path $script:Db -Last 50) | Where-Object { $_.action -eq 'enroll' })
+        $enrolls.Count | Should -Be 2
+        ($enrolls[0].meta_json | ConvertFrom-Json).reenroll | Should -BeTrue
+        [bool](($enrolls[1].meta_json | ConvertFrom-Json).PSObject.Properties['reenroll']) | Should -BeFalse
+        $bad = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hbBody -Headers @{ 'X-SCG-Device-Token' = $old }
+        $bad.Status | Should -Be 401
+        $bad.Body.error | Should -BeExactly 'invalid device token'
+        (Invoke-ScgHeartbeat -Config $script:Cfg -Body $hbBody -Headers @{ 'X-SCG-Device-Token' = $new }).Status | Should -Be 200
     }
     It 'enrolls a first-time hostname with a new id and no reenroll flag' {
         $a = Register-TestDevice -Name 'PC-01'
@@ -193,14 +260,14 @@ Describe 'Invoke-ScgHeartbeat' {
     BeforeEach { Reset-TestState }
     It 'answers 400 for missing device_id, hostname, sc_agents or a non-16-hex agent id' {
         $id = Register-TestDevice
-        (Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; sc_agents = @() })).Status | Should -Be 400
-        (Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; sc_agents = @() })).Status | Should -Be 400
-        (Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01' })).Status | Should -Be 400
+        (Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ hostname = 'PC-01'; sc_agents = @() })).Status | Should -Be 400
+        (Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; sc_agents = @() })).Status | Should -Be 400
+        (Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01' })).Status | Should -Be 400
         $bad = @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(@{ id = 'nothex'; service = 's'; folder = 'f'; uninstall_key = 'k'; state = 'Running' }) }
-        (Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody $bad)).Status | Should -Be 400
+        (Invoke-TestHeartbeat -Body (ConvertTo-TestBody $bad)).Status | Should -Be 400
     }
     It 'answers 404 for an unknown device' {
-        $r = Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = 'no-such-device'; hostname = 'X'; sc_agents = @() })
+        $r = Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = 'no-such-device'; hostname = 'X'; sc_agents = @() })
         $r.Status | Should -Be 404
         $r.Body.ok | Should -BeFalse
         $r.Body.error | Should -BeExactly 'unknown device'
@@ -211,11 +278,11 @@ Describe 'Invoke-ScgHeartbeat' {
         $cmdA = New-ScgCommand -Path $script:Db -DeviceId $a -Type 'ping' -Payload $null -IssuedBy 'system' -IssuedVia 'system'
         $cmdB = New-ScgCommand -Path $script:Db -DeviceId $b -Type 'status' -Payload $null -IssuedBy 'system' -IssuedVia 'system'
         $hb = ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; sc_agents = @() }
-        $first = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hb
+        $first = Invoke-TestHeartbeat -Body $hb
         $first.Status | Should -Be 200
         @($first.Body.commands).Count | Should -Be 1
         $first.Body.commands[0].id | Should -Be $cmdB
-        $second = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hb
+        $second = Invoke-TestHeartbeat -Body $hb
         $second.Status | Should -Be 200
         (@(Get-ScgDevice -Path $script:Db -DeviceId $b))[0].hostname | Should -Be 'PC-B'
         (@(Get-ScgDevice -Path $script:Db -DeviceId $a))[0].hostname | Should -Be 'PC-A'
@@ -229,9 +296,9 @@ Describe 'Invoke-ScgHeartbeat' {
     }
     It 'audits a new config_change when the reported hostname changes again' {
         $id = Register-TestDevice -Name 'PC-01'
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'NEW-1'; sc_agents = @() }))
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'NEW-2'; sc_agents = @() }))
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'NEW-1'; sc_agents = @() }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'NEW-2'; sc_agents = @() }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }))
         @(@(Get-ScgAudit -Path $script:Db -Last 50) | Where-Object { $_.action -eq 'heartbeat.config_change' }).Count | Should -Be 2
         (@(Get-ScgDevice -Path $script:Db -DeviceId $id))[0].hostname | Should -Be 'PC-01'
     }
@@ -239,22 +306,22 @@ Describe 'Invoke-ScgHeartbeat' {
         $a = Register-TestDevice -Name 'PC-A'
         $b = Register-TestDevice -Name 'PC-B'
         $cmdA = New-ScgCommand -Path $script:Db -DeviceId $a -Type 'ping' -Payload $null -IssuedBy 'system' -IssuedVia 'system'
-        $hbB = Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; sc_agents = @() })
+        $hbB = Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; sc_agents = @() })
         @($hbB.Body.commands).Count | Should -Be 0
-        $hbA = Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $a; hostname = 'PC-A'; sc_agents = @() })
+        $hbA = Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $a; hostname = 'PC-A'; sc_agents = @() })
         $hbA.Body.commands[0].id | Should -Be $cmdA
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; command_id = $cmdA; ok = $true })).Status | Should -Be 409
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; command_id = $cmdA; ok = $true })).Status | Should -Be 409
         (Get-ScgCommand -Path $script:Db -CommandId $cmdA).status | Should -Be 'dispatched'
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; type = 'tamper'; severity = 'warn' })).Status | Should -Be 200
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $a; hostname = 'PC-A'; command_id = $cmdA; ok = $true })).Status | Should -Be 200
+        (Invoke-TestEvent -Body (ConvertTo-TestBody @{ device_id = $b; hostname = 'PC-A'; type = 'tamper'; severity = 'warn' })).Status | Should -Be 200
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $a; hostname = 'PC-A'; command_id = $cmdA; ok = $true })).Status | Should -Be 200
     }
     It 'answers exactly unknown device for result and event too' {
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = 'ghost'; command_id = 'x'; ok = $true })).Body.error | Should -BeExactly 'unknown device'
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = 'ghost'; type = 'tamper'; severity = 'warn' })).Body.error | Should -BeExactly 'unknown device'
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = 'ghost'; command_id = 'x'; ok = $true })).Body.error | Should -BeExactly 'unknown device'
+        (Invoke-TestEvent -Body (ConvertTo-TestBody @{ device_id = 'ghost'; type = 'tamper'; severity = 'warn' })).Body.error | Should -BeExactly 'unknown device'
     }
     It 'returns config with the authoritative allow-list' {
         $id = Register-TestDevice
-        $r = Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(); uptime_sec = 5; agent_version = '4.0.0' })
+        $r = Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(); uptime_sec = 5; agent_version = '4.0.0' })
         $r.Status | Should -Be 200
         $r.Body.config.heartbeat_sec | Should -Be 60
         $r.Body.config.scan_interval_sec | Should -Be 30
@@ -268,8 +335,8 @@ Describe 'Invoke-ScgHeartbeat' {
             @{ id = 'aaaaaaaaaaaaaaaa'; service = 'ScreenConnect Client (b)'; folder = 'C:\b'; uninstall_key = 'kb'; state = 'Running' }
         )
         $body = ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = $agents; uptime_sec = 1; agent_version = '4.0.0' }
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body $body)
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body $body)
+        [void](Invoke-TestHeartbeat -Body $body)
+        [void](Invoke-TestHeartbeat -Body $body)
         $rows = @(Get-ScgScAgent -Path $script:Db -DeviceId $id)
         $rows.Count | Should -Be 2
         @(Get-ScgDevice -Path $script:Db).Count | Should -Be 1
@@ -279,33 +346,33 @@ Describe 'Invoke-ScgHeartbeat' {
     It 'removes absent agents only on an explicit empty list with discovery ok' {
         $id = Register-TestDevice
         $one = @{ id = $script:IdA; service = 's'; folder = 'f'; uninstall_key = 'k'; state = 'Running' }
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @($one) }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @($one) }))
         @(Get-ScgScAgent -Path $script:Db -DeviceId $id).Count | Should -Be 1
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(); discovery_ok = $false }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(); discovery_ok = $false }))
         @(Get-ScgScAgent -Path $script:Db -DeviceId $id).Count | Should -Be 1
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }))
         @(Get-ScgScAgent -Path $script:Db -DeviceId $id).Count | Should -Be 0
     }
     It 'answers 400 for a non-boolean discovery_ok' {
         $id = Register-TestDevice
-        (Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(); discovery_ok = 'no' })).Status | Should -Be 400
+        (Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @(); discovery_ok = 'no' })).Status | Should -Be 400
     }
     It 'returns a pending command exactly once and audits the dispatch' {
         $id = Register-TestDevice
         $cid = New-ScgCommand -Path $script:Db -DeviceId $id -Type 'ping' -Payload $null -IssuedBy 'telegram:1' -IssuedVia 'telegram'
         $hb = ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }
-        $first = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hb
+        $first = Invoke-TestHeartbeat -Body $hb
         @($first.Body.commands).Count | Should -Be 1
         $first.Body.commands[0].id | Should -Be $cid
         $first.Body.commands[0].type | Should -Be 'ping'
-        $second = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hb
+        $second = Invoke-TestHeartbeat -Body $hb
         @($second.Body.commands).Count | Should -Be 0
         @(@(Get-ScgAudit -Path $script:Db -Last 20) | Where-Object { $_.action -eq 'command.dispatch' }).Count | Should -Be 1
     }
     It 'reactivates a stale device' {
         $id = Register-TestDevice
         [void](Set-ScgDeviceStatus -Path $script:Db -DeviceId $id -Status 'stale')
-        [void](Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }))
+        [void](Invoke-TestHeartbeat -Body (ConvertTo-TestBody @{ device_id = $id; hostname = 'PC-01'; sc_agents = @() }))
         (@(Get-ScgDevice -Path $script:Db -DeviceId $id))[0].status | Should -Be 'active'
     }
 }
@@ -319,33 +386,33 @@ Describe 'Invoke-ScgResult' {
     }
     It 'completes a dispatched command and audits it' {
         [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
-        $r = Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true; output = 'pong'; duration_ms = 12 })
+        $r = Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true; output = 'pong'; duration_ms = 12 })
         $r.Status | Should -Be 200
         $r.Body.ok | Should -BeTrue
         @(@(Get-ScgAudit -Path $script:Db -Last 20) | Where-Object { $_.action -eq 'command.result' }).Count | Should -Be 1
     }
     It 'answers 400 for missing or invalid fields' {
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ command_id = $script:CmdA; ok = $true })).Status | Should -Be 400
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; ok = $true })).Status | Should -Be 400
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA })).Status | Should -Be 400
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = 'yes' })).Status | Should -Be 400
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ command_id = $script:CmdA; ok = $true })).Status | Should -Be 400
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevA; ok = $true })).Status | Should -Be 400
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA })).Status | Should -Be 400
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = 'yes' })).Status | Should -Be 400
     }
     It 'answers 404 for an unknown device' {
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = 'ghost'; command_id = $script:CmdA; ok = $true })).Status | Should -Be 404
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = 'ghost'; command_id = $script:CmdA; ok = $true })).Status | Should -Be 404
     }
     It 'answers 409 for a command that is still pending' {
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true })).Status | Should -Be 409
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true })).Status | Should -Be 409
     }
     It 'answers 409 when another device reports the command' {
         [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevB; command_id = $script:CmdA; ok = $true })).Status | Should -Be 409
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevB; command_id = $script:CmdA; ok = $true })).Status | Should -Be 409
     }
     It 'answers 409 for an unknown command id and for a second result' {
-        (Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = 'nope'; ok = $true })).Status | Should -Be 409
+        (Invoke-TestResult -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = 'nope'; ok = $true })).Status | Should -Be 409
         [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
         $body = ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $false; output = 'x'; duration_ms = 1 }
-        (Invoke-ScgResult -Config $script:Cfg -Body $body).Status | Should -Be 200
-        (Invoke-ScgResult -Config $script:Cfg -Body $body).Status | Should -Be 409
+        (Invoke-TestResult -Body $body).Status | Should -Be 200
+        (Invoke-TestResult -Body $body).Status | Should -Be 409
     }
     It 'sends a Telegram notice only when a chat is configured' {
         [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
@@ -354,7 +421,7 @@ Describe 'Invoke-ScgResult' {
         $send = { param($Text, $Markup, $ChatId, $EditId) [void]$sink.Add($Text) }.GetNewClosure()
         $cfgChat = New-TestConfig -Db $script:Db -ChatId '-100123'
         $body = ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true; output = 'pong'; duration_ms = 5 }
-        (Invoke-ScgResult -Config $cfgChat -Body $body -Send $send).Status | Should -Be 200
+        (Invoke-TestResult -Config $cfgChat -Body $body -Send $send).Status | Should -Be 200
         $script:Sent.Count | Should -Be 1
         $script:Sent[0] | Should -Match 'PC-A'
         $script:Sent[0] | Should -Match 'ping'
@@ -362,7 +429,7 @@ Describe 'Invoke-ScgResult' {
         $cmd2 = New-ScgCommand -Path $script:Db -DeviceId $script:DevA -Type 'status' -Payload $null -IssuedBy 'system' -IssuedVia 'system'
         [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
         $body2 = ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $cmd2; ok = $true }
-        (Invoke-ScgResult -Config $script:Cfg -Body $body2 -Send $send).Status | Should -Be 200
+        (Invoke-TestResult -Body $body2 -Send $send).Status | Should -Be 200
         $script:Sent.Count | Should -Be 1
     }
 }
@@ -371,7 +438,7 @@ Describe 'Invoke-ScgEventIngest' {
     BeforeEach { Reset-TestState }
     It 'stores an event and audits it' {
         $id = Register-TestDevice
-        $r = Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; type = 'tamper'; severity = 'critical'; payload = @{ agent = $script:IdA } })
+        $r = Invoke-TestEvent -Body (ConvertTo-TestBody @{ device_id = $id; type = 'tamper'; severity = 'critical'; payload = @{ agent = $script:IdA } })
         $r.Status | Should -Be 200
         @(Get-ScgEvent -Path $script:Db -Last 10).Count | Should -Be 1
         @(@(Get-ScgAudit -Path $script:Db -Last 20) | Where-Object { $_.action -eq 'event.ingest' }).Count | Should -Be 1
@@ -379,20 +446,20 @@ Describe 'Invoke-ScgEventIngest' {
     It 'dedupes a repeated identical event yet still answers ok' {
         $id = Register-TestDevice
         $body = ConvertTo-TestBody @{ device_id = $id; type = 'service_down'; severity = 'warn'; payload = @{ service = 'x' } }
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body $body).Status | Should -Be 200
-        $again = Invoke-ScgEventIngest -Config $script:Cfg -Body $body
+        (Invoke-TestEvent -Body $body).Status | Should -Be 200
+        $again = Invoke-TestEvent -Body $body
         $again.Status | Should -Be 200
         $again.Body.ok | Should -BeTrue
         @(Get-ScgEvent -Path $script:Db -Last 10).Count | Should -Be 1
     }
     It 'answers 400 for a bad type, bad severity or missing device_id' {
         $id = Register-TestDevice
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; type = 'bogus'; severity = 'warn' })).Status | Should -Be 400
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $id; type = 'tamper'; severity = 'huge' })).Status | Should -Be 400
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ type = 'tamper'; severity = 'warn' })).Status | Should -Be 400
+        (Invoke-TestEvent -Body (ConvertTo-TestBody @{ device_id = $id; type = 'bogus'; severity = 'warn' })).Status | Should -Be 400
+        (Invoke-TestEvent -Body (ConvertTo-TestBody @{ device_id = $id; type = 'tamper'; severity = 'huge' })).Status | Should -Be 400
+        (Invoke-TestEvent -Body (ConvertTo-TestBody @{ type = 'tamper'; severity = 'warn' })).Status | Should -Be 400
     }
     It 'answers 404 for an unknown device' {
-        (Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = 'ghost'; type = 'tamper'; severity = 'warn' })).Status | Should -Be 404
+        (Invoke-TestEvent -Body (ConvertTo-TestBody @{ device_id = 'ghost'; type = 'tamper'; severity = 'warn' })).Status | Should -Be 404
     }
 }
 
@@ -462,7 +529,7 @@ Describe 'Hub routes through Invoke-ScgRequestPipeline' {
         $enroll.Status | Should -Be 200
         $id = $enroll.Body.device_id
         $hbBody = (@{ device_id = $id; hostname = 'PC-9'; sc_agents = @(); uptime_sec = 3; agent_version = '4.0.0' } | ConvertTo-Json -Compress)
-        $hb = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers (New-TestHeader) -Body $hbBody -RemoteIp '10.0.0.9' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache
+        $hb = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers (Get-TestDeviceHeader -Token $enroll.Body.device_token) -Body $hbBody -RemoteIp '10.0.0.9' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache
         $hb.Status | Should -Be 200
         @($hb.Body.commands).Count | Should -Be 0
         $health = Invoke-ScgRequestPipeline -Method GET -Path '/api/v1/health' -Headers (New-TestHeader) -Body '' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache
@@ -481,5 +548,126 @@ Describe 'Hub routes through Invoke-ScgRequestPipeline' {
         $r.Status | Should -Be 404
         $r2 = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/enroll' -Headers (New-TestHeader) -Body '{"hostname":"only"}' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache
         $r2.Status | Should -Be 400
+    }
+    It 'enforces device tokens end to end on heartbeat, event and result and 409 on re-enroll' {
+        $pipe = @{ Secret = $script:Secret; Route = $script:Routes; ReplayCache = $script:Cache; RemoteIp = '10.0.0.9' }
+        $ea = Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/enroll' -Headers (New-TestHeader) -Body '{"hostname":"PC-A","os":"Windows","os_version":"10","agent_version":"4.0.0"}'
+        $eb = Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/enroll' -Headers (New-TestHeader) -Body '{"hostname":"PC-B","os":"Windows","os_version":"10","agent_version":"4.0.0"}'
+        $ea.Status | Should -Be 200
+        $eb.Status | Should -Be 200
+        $idA = [string]$ea.Body.device_id
+        $tokA = [string]$ea.Body.device_token
+        $tokB = [string]$eb.Body.device_token
+        $hbA = (@{ device_id = $idA; hostname = 'PC-A'; sc_agents = @() } | ConvertTo-Json -Compress)
+        $evA = (@{ device_id = $idA; type = 'tamper'; severity = 'warn'; payload = @{ detail = 'x' } } | ConvertTo-Json -Compress)
+
+        $noTok = Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/heartbeat' -Headers (New-TestHeader) -Body $hbA
+        $noTok.Status | Should -Be 401
+        $noTok.Body.error | Should -BeExactly 'invalid device token'
+        (Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/heartbeat' -Headers (Get-TestDeviceHeader -Token $tokB) -Body $hbA).Status | Should -Be 401
+        (Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/event' -Headers (Get-TestDeviceHeader -Token $tokB) -Body $evA).Status | Should -Be 401
+        @(Get-ScgEvent -Path $script:Db -Last 10).Count | Should -Be 0
+
+        $cmd = New-ScgCommand -Path $script:Db -DeviceId $idA -Type 'ping' -Payload $null -IssuedBy 'system' -IssuedVia 'system'
+        $ok = Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/heartbeat' -Headers (Get-TestDeviceHeader -Token $tokA) -Body $hbA
+        $ok.Status | Should -Be 200
+        @($ok.Body.commands).Count | Should -Be 1
+        $resA = (@{ device_id = $idA; command_id = $cmd; ok = $true; output = 'pong'; duration_ms = 3 } | ConvertTo-Json -Compress)
+        (Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/result' -Headers (Get-TestDeviceHeader -Token $tokB) -Body $resA).Status | Should -Be 401
+        (Get-ScgCommand -Path $script:Db -CommandId $cmd).status | Should -Be 'dispatched'
+        (Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/result' -Headers (Get-TestDeviceHeader -Token $tokA) -Body $resA).Status | Should -Be 200
+        (Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/event' -Headers (Get-TestDeviceHeader -Token $tokA) -Body $evA).Status | Should -Be 200
+
+        $again = Invoke-ScgRequestPipeline @pipe -Method POST -Path '/api/v1/enroll' -Headers (New-TestHeader) -Body '{"hostname":"PC-A","os":"Windows","os_version":"10","agent_version":"4.0.1"}'
+        $again.Status | Should -Be 409
+        $again.Body.error | Should -BeExactly 'hostname already enrolled'
+        $dump = (@(Get-ScgAudit -Path $script:Db -Last 200) | ConvertTo-Json -Depth 4 -Compress)
+        $dump.Contains($tokA) | Should -BeFalse
+        $dump.Contains($tokB) | Should -BeFalse
+    }
+}
+
+Describe 'Device token enforcement' {
+    BeforeEach {
+        Reset-TestState
+        $script:DevA = Register-TestDevice -Name 'PC-A'
+        $script:DevB = Register-TestDevice -Name 'PC-B'
+        $script:TokB = $script:Tokens[$script:DevB]
+        $script:CmdA = New-ScgCommand -Path $script:Db -DeviceId $script:DevA -Type 'ping' -Payload $null -IssuedBy 'system' -IssuedVia 'system'
+        $script:OldSeen = '2020-01-01T00:00:00.000Z'
+        [void](Invoke-ScgSql -Path $script:Db -NonQuery -Sql 'UPDATE devices SET last_seen=@t WHERE id=@id' -Parameter @{ t = $script:OldSeen; id = $script:DevA })
+    }
+    It 'rejects device B token for device A on heartbeat without any state change' {
+        $one = @{ id = $script:IdA; service = 's'; folder = 'f'; uninstall_key = 'k'; state = 'Running' }
+        $body = ConvertTo-TestBody @{ device_id = $script:DevA; hostname = 'RENAMED'; sc_agents = @($one) }
+        $r = Invoke-ScgHeartbeat -Config $script:Cfg -Body $body -RemoteIp '10.9.9.9' -Headers @{ 'X-SCG-Device-Token' = $script:TokB }
+        $r.Status | Should -Be 401
+        $r.Body.error | Should -BeExactly 'invalid device token'
+        $row = (@(Get-ScgDevice -Path $script:Db -DeviceId $script:DevA))[0]
+        $row.last_seen | Should -Be $script:OldSeen
+        $row.last_ip | Should -Be '10.0.0.5'
+        @(Get-ScgScAgent -Path $script:Db -DeviceId $script:DevA).Count | Should -Be 0
+        (Get-ScgCommand -Path $script:Db -CommandId $script:CmdA).status | Should -Be 'pending'
+        @(@(Get-ScgAudit -Path $script:Db -Last 50) | Where-Object { $_.action -eq 'heartbeat.config_change' }).Count | Should -Be 0
+        Get-TestRejectReason | Should -Contain 'bad_device_token'
+    }
+    It 'rejects device B token for device A on result and event' {
+        [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
+        $res = Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true }) -Headers @{ 'X-SCG-Device-Token' = $script:TokB }
+        $res.Status | Should -Be 401
+        $res.Body.error | Should -BeExactly 'invalid device token'
+        (Get-ScgCommand -Path $script:Db -CommandId $script:CmdA).status | Should -Be 'dispatched'
+        $ev = Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; type = 'tamper'; severity = 'warn' }) -Headers @{ 'X-SCG-Device-Token' = $script:TokB }
+        $ev.Status | Should -Be 401
+        $ev.Body.error | Should -BeExactly 'invalid device token'
+        @(Get-ScgEvent -Path $script:Db -Last 10).Count | Should -Be 0
+        @(Get-TestRejectReason | Where-Object { $_ -eq 'bad_device_token' }).Count | Should -Be 2
+    }
+    It 'answers 401 for a missing or empty device token header on all three endpoints' {
+        [void](Get-ScgDispatchableCommand -Path $script:Db -DeviceId $script:DevA)
+        $hb = ConvertTo-TestBody @{ device_id = $script:DevA; hostname = 'PC-A'; sc_agents = @() }
+        $res = ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true }
+        $ev = ConvertTo-TestBody @{ device_id = $script:DevA; type = 'tamper'; severity = 'warn' }
+        foreach ($hdr in @($null, @{}, @{ 'X-SCG-Device-Token' = '' })) {
+            $r1 = Invoke-ScgHeartbeat -Config $script:Cfg -Body $hb -Headers $hdr
+            $r2 = Invoke-ScgResult -Config $script:Cfg -Body $res -Headers $hdr
+            $r3 = Invoke-ScgEventIngest -Config $script:Cfg -Body $ev -Headers $hdr
+            foreach ($r in @($r1, $r2, $r3)) {
+                $r.Status | Should -Be 401
+                $r.Body.error | Should -BeExactly 'invalid device token'
+            }
+        }
+        (Invoke-ScgHeartbeat -Config $script:Cfg -Body $hb).Status | Should -Be 401
+        (Get-ScgCommand -Path $script:Db -CommandId $script:CmdA).status | Should -Be 'dispatched'
+        @(Get-ScgEvent -Path $script:Db -Last 10).Count | Should -Be 0
+        (@(Get-ScgDevice -Path $script:Db -DeviceId $script:DevA))[0].last_seen | Should -Be $script:OldSeen
+    }
+    It 'answers 401 device not enrolled on all three endpoints after a reset' {
+        $tokA = $script:Tokens[$script:DevA]
+        [void](Clear-ScgDeviceToken -Path $script:Db -DeviceId $script:DevA)
+        $h = @{ 'X-SCG-Device-Token' = $tokA }
+        $r1 = Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; hostname = 'PC-A'; sc_agents = @() }) -Headers $h
+        $r2 = Invoke-ScgResult -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; command_id = $script:CmdA; ok = $true }) -Headers $h
+        $r3 = Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; type = 'tamper'; severity = 'warn' }) -Headers $h
+        foreach ($r in @($r1, $r2, $r3)) {
+            $r.Status | Should -Be 401
+            $r.Body.error | Should -BeExactly 'device not enrolled'
+        }
+        @(Get-TestRejectReason | Where-Object { $_ -eq 'device_not_enrolled' }).Count | Should -Be 3
+    }
+    It 'answers 404 unknown device before checking the token' {
+        $r = Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = 'ghost'; hostname = 'X'; sc_agents = @() }) -Headers @{ 'X-SCG-Device-Token' = $script:TokB }
+        $r.Status | Should -Be 404
+        $r.Body.error | Should -BeExactly 'unknown device'
+    }
+    It 'accepts the header name in any case and never writes the token to the audit log' {
+        $tokA = $script:Tokens[$script:DevA]
+        $nvc = New-Object System.Collections.Specialized.NameValueCollection
+        $nvc.Add('x-scg-device-token', $tokA)
+        (Invoke-ScgHeartbeat -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; hostname = 'PC-A'; sc_agents = @() }) -Headers $nvc).Status | Should -Be 200
+        [void](Invoke-ScgEventIngest -Config $script:Cfg -Body (ConvertTo-TestBody @{ device_id = $script:DevA; type = 'tamper'; severity = 'warn' }) -Headers @{ 'X-SCG-Device-Token' = $script:TokB })
+        $dump = (@(Get-ScgAudit -Path $script:Db -Last 200) | ConvertTo-Json -Depth 4 -Compress)
+        $dump.Contains($tokA) | Should -BeFalse
+        $dump.Contains($script:TokB) | Should -BeFalse
     }
 }

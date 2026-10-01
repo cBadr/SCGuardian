@@ -301,7 +301,11 @@ function Write-ScgHubHostnameDrift {
 function Invoke-ScgEnroll {
 <#
 .SYNOPSIS
-    POST /enroll: registers (or re-registers) a device and returns its id.
+    POST /enroll: registers a device and returns its id plus a one-time device_token (v2.0).
+.DESCRIPTION
+    New hostname: create + token. Existing hostname with token_hash set: 409 (audit auth.reject
+    enroll_conflict). Existing hostname with token_hash NULL (admin reset): same id, new token, audit
+    enroll meta reenroll=true. Only Get-ScgTokenHash of the token is stored; the token is never logged.
 .PARAMETER Config
     Hub config.
 .PARAMETER Body
@@ -324,18 +328,98 @@ function Invoke-ScgEnroll {
     $reenroll = $false
     $existing = @(Get-ScgDevice -Path $db -Hostname $hostname)
     if ($existing.Count -gt 0 -and $null -ne $existing[0]) {
-        $stale = [int](Get-ScgHubSetting -Config $Config -Section 'defaults' -Key 'stale_after_min' -Default 5)
-        if (Test-ScgDeviceOnline -Path $db -DeviceId ([string]$existing[0].id) -StaleAfterMin $stale) {
-            Add-ScgAudit -Path $db -Actor 'system' -Action 'auth.reject' -Target $RemoteIp -Meta ([ordered]@{ reason = 'enroll_conflict'; hostname = $hostname })
-            return (New-ScgHubError -Status 409 -Message 'hostname already enrolled and online')
+        if (-not [string]::IsNullOrEmpty([string](Get-ScgHubValue -Object $existing[0] -Name 'token_hash'))) {
+            return (Write-ScgHubEnrollConflict -DbPath $db -Hostname $hostname -RemoteIp $RemoteIp)
         }
         $reenroll = $true
     }
     $dev = Register-ScgDevice -Path $db -Hostname $hostname -Os $os -OsVersion $osv -AgentVersion $av -LastIp $RemoteIp
+    $token = New-ScgDeviceToken
+    if (-not (Set-ScgDeviceToken -Path $db -DeviceId ([string]$dev.id) -TokenHash (Get-ScgTokenHash -Token $token) -IfUnset)) {
+        return (Write-ScgHubEnrollConflict -DbPath $db -Hostname $hostname -RemoteIp $RemoteIp)
+    }
     $meta = [ordered]@{ os = $os; os_version = $osv; agent_version = $av; ip = $RemoteIp }
     if ($reenroll) { $meta['reenroll'] = $true }
     Add-ScgAudit -Path $db -Actor ('device:' + $hostname) -Action 'enroll' -Target ([string]$dev.id) -Meta $meta
-    return (New-ScgHubResult -Status 200 -Body ([ordered]@{ ok = $true; device_id = [string]$dev.id }))
+    return (New-ScgHubResult -Status 200 -Body ([ordered]@{ ok = $true; device_id = [string]$dev.id; device_token = $token }))
+}
+
+function Write-ScgHubEnrollConflict {
+<#
+.SYNOPSIS
+    Audits auth.reject (reason enroll_conflict) and returns the 409 for a hostname that already holds a token.
+.PARAMETER DbPath
+    Database path.
+.PARAMETER Hostname
+    Requested hostname.
+.PARAMETER RemoteIp
+    Caller IP.
+#>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter(Mandatory)][string]$DbPath, [Parameter(Mandatory)][string]$Hostname, [string]$RemoteIp = '')
+    Add-ScgAudit -Path $DbPath -Actor 'system' -Action 'auth.reject' -Target $RemoteIp -Meta ([ordered]@{ reason = 'enroll_conflict'; hostname = $Hostname })
+    return (New-ScgHubError -Status 409 -Message 'hostname already enrolled')
+}
+
+function Get-ScgHubHeader {
+<#
+.SYNOPSIS
+    Reads a request header case-insensitively from a dictionary or NameValueCollection; null when absent.
+.PARAMETER Headers
+    Request headers (may be null).
+.PARAMETER Name
+    Header name.
+#>
+    [CmdletBinding()]
+    param([AllowNull()]$Headers, [Parameter(Mandatory)][string]$Name)
+    if ($null -eq $Headers) { return $null }
+    if ($Headers -is [System.Collections.Specialized.NameValueCollection]) { return $Headers[$Name] }
+    if ($Headers -is [System.Collections.IDictionary]) {
+        foreach ($k in @($Headers.Keys)) {
+            if ([string]$k -ieq $Name) { return $Headers[$k] }
+        }
+    }
+    return $null
+}
+
+function Test-ScgHubDeviceAuth {
+<#
+.SYNOPSIS
+    Verifies X-SCG-Device-Token against the stored token_hash of a device row (v2.0).
+.DESCRIPTION
+    Returns null when the token matches; otherwise audits auth.reject (reason device_not_enrolled or
+    bad_device_token, never the token) and returns the 401 error result.
+.PARAMETER DbPath
+    Database path.
+.PARAMETER Device
+    Device row (from Get-ScgDevice).
+.PARAMETER Headers
+    Request headers.
+.PARAMETER RemoteIp
+    Caller IP.
+#>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DbPath,
+        [Parameter(Mandatory)]$Device,
+        [AllowNull()]$Headers,
+        [string]$RemoteIp = ''
+    )
+    $deviceId = [string](Get-ScgHubValue -Object $Device -Name 'id')
+    $hash = [string](Get-ScgHubValue -Object $Device -Name 'token_hash')
+    if ([string]::IsNullOrEmpty($hash)) {
+        Add-ScgAudit -Path $DbPath -Actor 'system' -Action 'auth.reject' -Target $RemoteIp -Meta ([ordered]@{ reason = 'device_not_enrolled'; device_id = $deviceId })
+        return (New-ScgHubError -Status 401 -Message 'device not enrolled')
+    }
+    $presented = [string](Get-ScgHubHeader -Headers $Headers -Name 'X-SCG-Device-Token')
+    $ok = $false
+    if (-not [string]::IsNullOrEmpty($presented)) { $ok = [bool](Test-ScgDeviceToken -Token $presented -Hash $hash) }
+    if (-not $ok) {
+        Add-ScgAudit -Path $DbPath -Actor 'system' -Action 'auth.reject' -Target $RemoteIp -Meta ([ordered]@{ reason = 'bad_device_token'; device_id = $deviceId })
+        return (New-ScgHubError -Status 401 -Message 'invalid device token')
+    }
+    return $null
 }
 
 function Invoke-ScgHeartbeat {
@@ -349,10 +433,12 @@ function Invoke-ScgHeartbeat {
     (false means the agent's discovery failed: rows are never deleted for that beat).
 .PARAMETER RemoteIp
     Caller IP.
+.PARAMETER Headers
+    Request headers; X-SCG-Device-Token is verified before any state change (v2.0).
 #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)]$Config, [AllowNull()]$Body, [string]$RemoteIp = '')
+    param([Parameter(Mandatory)]$Config, [AllowNull()]$Body, [string]$RemoteIp = '', [AllowNull()]$Headers)
     $db = [string](Get-ScgHubSetting -Config $Config -Section 'database' -Key 'path')
     $deviceId = Get-ScgHubText -Object $Body -Name 'device_id'
     $hostname = Get-ScgHubText -Object $Body -Name 'hostname'
@@ -391,7 +477,9 @@ function Invoke-ScgHeartbeat {
     }
 
     $found = @(Get-ScgDevice -Path $db -DeviceId $deviceId)
-    if ($found.Count -eq 0) { return (New-ScgHubError -Status 404 -Message 'unknown device') }
+    if ($found.Count -eq 0 -or $null -eq $found[0]) { return (New-ScgHubError -Status 404 -Message 'unknown device') }
+    $denied = Test-ScgHubDeviceAuth -DbPath $db -Device $found[0] -Headers $Headers -RemoteIp $RemoteIp
+    if ($null -ne $denied) { return $denied }
 
     $stored = [string](Get-ScgHubValue -Object $found[0] -Name 'hostname')
     Write-ScgHubHostnameDrift -DbPath $db -DeviceId $deviceId -Stored $stored -Reported $hostname
@@ -440,10 +528,12 @@ function Invoke-ScgResult {
     Caller IP.
 .PARAMETER Send
     Optional injectable Telegram sender (text, markup, chat id, edit id).
+.PARAMETER Headers
+    Request headers; X-SCG-Device-Token is verified before any state change (v2.0).
 #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)]$Config, [AllowNull()]$Body, [string]$RemoteIp = '', [scriptblock]$Send)
+    param([Parameter(Mandatory)]$Config, [AllowNull()]$Body, [string]$RemoteIp = '', [scriptblock]$Send, [AllowNull()]$Headers)
     $db = [string](Get-ScgHubSetting -Config $Config -Section 'database' -Key 'path')
     $deviceId = Get-ScgHubText -Object $Body -Name 'device_id'
     $commandId = Get-ScgHubText -Object $Body -Name 'command_id'
@@ -465,7 +555,9 @@ function Invoke-ScgResult {
     }
 
     $found = @(Get-ScgDevice -Path $db -DeviceId $deviceId)
-    if ($found.Count -eq 0) { return (New-ScgHubError -Status 404 -Message 'unknown device') }
+    if ($found.Count -eq 0 -or $null -eq $found[0]) { return (New-ScgHubError -Status 404 -Message 'unknown device') }
+    $denied = Test-ScgHubDeviceAuth -DbPath $db -Device $found[0] -Headers $Headers -RemoteIp $RemoteIp
+    if ($null -ne $denied) { return $denied }
     $hostname = [string](Get-ScgHubValue -Object $found[0] -Name 'hostname')
     $reported = Get-ScgHubText -Object $Body -Name 'hostname'
     if ($reported) { Write-ScgHubHostnameDrift -DbPath $db -DeviceId $deviceId -Stored $hostname -Reported $reported }
@@ -512,10 +604,12 @@ function Invoke-ScgEventIngest {
     Parsed request body: device_id, type, severity, payload.
 .PARAMETER RemoteIp
     Caller IP.
+.PARAMETER Headers
+    Request headers; X-SCG-Device-Token is verified before any state change (v2.0).
 #>
     [CmdletBinding()]
     [OutputType([hashtable])]
-    param([Parameter(Mandatory)]$Config, [AllowNull()]$Body, [string]$RemoteIp = '')
+    param([Parameter(Mandatory)]$Config, [AllowNull()]$Body, [string]$RemoteIp = '', [AllowNull()]$Headers)
     $db = [string](Get-ScgHubSetting -Config $Config -Section 'database' -Key 'path')
     $deviceId = Get-ScgHubText -Object $Body -Name 'device_id'
     $type = Get-ScgHubText -Object $Body -Name 'type'
@@ -528,7 +622,9 @@ function Invoke-ScgEventIngest {
     $payloadJson = ConvertTo-Json -InputObject $payload -Compress -Depth 8
 
     $found = @(Get-ScgDevice -Path $db -DeviceId $deviceId)
-    if ($found.Count -eq 0) { return (New-ScgHubError -Status 404 -Message 'unknown device') }
+    if ($found.Count -eq 0 -or $null -eq $found[0]) { return (New-ScgHubError -Status 404 -Message 'unknown device') }
+    $denied = Test-ScgHubDeviceAuth -DbPath $db -Device $found[0] -Headers $Headers -RemoteIp $RemoteIp
+    if ($null -ne $denied) { return $denied }
     $hostname = [string](Get-ScgHubValue -Object $found[0] -Name 'hostname')
     $reported = Get-ScgHubText -Object $Body -Name 'hostname'
     if ($reported) { Write-ScgHubHostnameDrift -DbPath $db -DeviceId $deviceId -Stored $hostname -Reported $reported }
@@ -616,9 +712,9 @@ function New-ScgHubRoute {
     $script:HubConfig = $Config
     return @{
         'POST /enroll'    = { param($Request) Invoke-ScgEnroll -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp }
-        'POST /heartbeat' = { param($Request) Invoke-ScgHeartbeat -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp }
-        'POST /result'    = { param($Request) Invoke-ScgResult -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp }
-        'POST /event'     = { param($Request) Invoke-ScgEventIngest -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp }
+        'POST /heartbeat' = { param($Request) Invoke-ScgHeartbeat -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp -Headers $(if ($Request.PSObject.Properties['Headers']) { $Request.Headers }) }
+        'POST /result'    = { param($Request) Invoke-ScgResult -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp -Headers $(if ($Request.PSObject.Properties['Headers']) { $Request.Headers }) }
+        'POST /event'     = { param($Request) Invoke-ScgEventIngest -Config (Get-ScgHubActiveConfig) -Body $Request.Body -RemoteIp $Request.RemoteIp -Headers $(if ($Request.PSObject.Properties['Headers']) { $Request.Headers }) }
         'GET /health'     = { param($Request) Get-ScgHealth -Config (Get-ScgHubActiveConfig) }
     }
 }

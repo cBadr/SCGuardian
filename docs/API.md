@@ -2,30 +2,33 @@
 
 Base URL: `https://ostazna.pro:8443/api/v1` (host and port come from your DNS name and `listen.url`).
 JSON only (`application/json; charset=utf-8`). This page explains the contract in `docs/contracts/api-registry.md`
-(frozen, contract v1.2); if the two ever disagree, the contract and the code win.
+(frozen, contract v2.0, per-device tokens); if the two ever disagree, the contract and the code win.
 
 ## 1. Endpoints
 
 | Method | Path | Request body | Success response | Error statuses |
 |---|---|---|---|---|
-| POST | `/enroll` | `{hostname, os, os_version, agent_version}` | `{ok, device_id}` | 400, 401, 408, 409 |
+| POST | `/enroll` | `{hostname, os, os_version, agent_version}` | `{ok, device_id, device_token}` (the token is returned **once**) | 400, 401, 408, 409 |
 | POST | `/heartbeat` | `{device_id, hostname, sc_agents:[{id,service,folder,uninstall_key,state}], uptime_sec, agent_version, discovery_ok?}` | `{ok, commands:[{id,type,payload}], config:{scan_interval_sec,heartbeat_sec,allowed_ids,alert_throttle_min}}` | 400, 401, 404, 408, 409 |
 | POST | `/result` | `{device_id, command_id, ok, output, duration_ms}` | `{ok}` | 400, 401, 404, 408, 409 |
 | POST | `/event` | `{device_id, type, severity, payload}` | `{ok}` (a deduplicated event still returns `ok`) | 400, 401, 404, 408, 409 |
 | GET | `/health` | none | `{ok, version, uptime_sec, devices_online, commands_pending}` | 401, 408, 409 |
 
-Every endpoint, including `/health`, requires the three auth headers below. 408/409/503 can be returned by any
+Every endpoint, including `/health`, requires the three auth headers below. `/heartbeat`, `/result` and `/event`
+additionally require the per-device header `X-SCG-Device-Token` (section 2.3). 408/409/503 can be returned by any
 endpoint, because the replay check runs for all authenticated requests.
 
 ## 2. Required headers
 
 | Header | Value |
 |---|---|
-| `Authorization` | `Bearer <shared_secret>` |
+| `Authorization` | `Bearer <shared_secret>` (every endpoint; for `/enroll` it is the bootstrap credential) |
+| `X-SCG-Device-Token` | the `device_token` returned by `/enroll`. **Required on `/heartbeat`, `/result`, `/event` only**; not sent to `/enroll` or `/health` |
 | `X-SCG-Timestamp` | current UTC time, ISO 8601 with a trailing `Z`, for example `2026-10-01T09:30:00.123Z` (fraction of 1 to 7 digits is accepted, or none) |
 | `X-SCG-Nonce` | a fresh unique string, 8 to 64 characters of `A-Za-z0-9-` (a GUID fits). Never reuse one. |
 
-Placeholders below: `<SECRET>` is the value of `shared_secret`. Never paste a real secret into tickets or chat.
+Placeholders below: `<SECRET>` is the value of `shared_secret`, `<DEVICE_TOKEN>` the value returned once by `/enroll`.
+Never paste a real secret or token into tickets or chat.
 
 ### 2.1 PowerShell: build the headers and call the API
 
@@ -33,17 +36,23 @@ Placeholders below: `<SECRET>` is the value of `shared_secret`. Never paste a re
 $HubUrl = 'https://ostazna.pro:8443'
 $Secret = '<SECRET>'
 
+$DeviceToken = '<DEVICE_TOKEN>'   # returned once by /enroll; only needed for /heartbeat, /result, /event
+
 function New-ScgHeader {
-    @{
+    param([switch]$WithDeviceToken)
+    $h = @{
         Authorization     = "Bearer $Secret"
         'X-SCG-Timestamp' = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
         'X-SCG-Nonce'     = [guid]::NewGuid().ToString()
     }
+    if ($WithDeviceToken) { $h['X-SCG-Device-Token'] = $DeviceToken }
+    $h
 }
 
 function Invoke-ScgApi {
     param([string]$Method, [string]$Path, $Body)
-    $p = @{ Uri = "$HubUrl/api/v1$Path"; Method = $Method; Headers = (New-ScgHeader); UseBasicParsing = $true }
+    $needsToken = $Path -in '/heartbeat', '/result', '/event'
+    $p = @{ Uri = "$HubUrl/api/v1$Path"; Method = $Method; Headers = (New-ScgHeader -WithDeviceToken:$needsToken); UseBasicParsing = $true }
     if ($null -ne $Body) {
         $p.Body = [Text.Encoding]::UTF8.GetBytes(($Body | ConvertTo-Json -Depth 8 -Compress))
         $p.ContentType = 'application/json; charset=utf-8'
@@ -59,12 +68,13 @@ function Invoke-ScgApi {
 # GET /health
 Invoke-ScgApi -Method GET -Path '/health'
 
-# POST /enroll
-Invoke-ScgApi -Method POST -Path '/enroll' -Body @{
+# POST /enroll  -> { ok, device_id, device_token }; save device_token now, it is never shown again
+$enr = Invoke-ScgApi -Method POST -Path '/enroll' -Body @{
     hostname = 'PC-TEST-01'; os = 'windows'; os_version = '10.0.19045.0'; agent_version = '4.0.0'
 }
+$DeviceToken = $enr.device_token
 
-# POST /heartbeat (empty sc_agents with discovery_ok = true means "this device has none")
+# POST /heartbeat (X-SCG-Device-Token is added automatically; empty sc_agents with discovery_ok = true means "this device has none")
 Invoke-ScgApi -Method POST -Path '/heartbeat' -Body @{
     device_id = '<DEVICE_ID>'; hostname = 'PC-TEST-01'; sc_agents = @()
     discovery_ok = $true; uptime_sec = 120; agent_version = '4.0.0'
@@ -80,13 +90,15 @@ device for experiments.
 ```bash
 HUB=https://ostazna.pro:8443
 SECRET='<SECRET>'
+DEVICE_TOKEN='<DEVICE_TOKEN>'   # returned once by /enroll; only sent to /heartbeat, /result, /event
 hdr() {
   printf -- '-H\0Authorization: Bearer %s\0-H\0X-SCG-Timestamp: %s\0-H\0X-SCG-Nonce: %s\0' \
     "$SECRET" "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" "$(cat /proc/sys/kernel/random/uuid)"
+  case "$1" in /heartbeat|/result|/event) printf -- '-H\0X-SCG-Device-Token: %s\0' "$DEVICE_TOKEN" ;; esac
 }
 call() { # usage: call METHOD PATH [JSON]
   local m=$1 p=$2 b=$3 args=()
-  while IFS= read -r -d '' a; do args+=("$a"); done < <(hdr)
+  while IFS= read -r -d '' a; do args+=("$a"); done < <(hdr "$p")
   if [ -n "$b" ]; then
     curl -sS -X "$m" "$HUB/api/v1$p" "${args[@]}" -H 'Content-Type: application/json' --data "$b" -w '\nHTTP %{http_code}\n'
   else
@@ -96,6 +108,7 @@ call() { # usage: call METHOD PATH [JSON]
 
 call GET  /health
 call POST /enroll '{"hostname":"PC-TEST-01","os":"windows","os_version":"10.0.19045.0","agent_version":"4.0.0"}'
+# -> {"ok":true,"device_id":"<DEVICE_ID>","device_token":"<DEVICE_TOKEN>"}  (shown once; set DEVICE_TOKEN from it)
 call POST /heartbeat '{"device_id":"<DEVICE_ID>","hostname":"PC-TEST-01","sc_agents":[],"discovery_ok":true,"uptime_sec":120,"agent_version":"4.0.0"}'
 call POST /result '{"device_id":"<DEVICE_ID>","command_id":"<COMMAND_ID>","ok":true,"output":"pong","duration_ms":12}'
 call POST /event '{"device_id":"<DEVICE_ID>","type":"unknown_agent","severity":"warn","payload":{"sc_id":"0123456789abcdef","service":"ScreenConnect Client (0123456789abcdef)","folder":"C:\\Program Files (x86)\\ScreenConnect Client (0123456789abcdef)"}}'
@@ -104,17 +117,26 @@ call POST /event '{"device_id":"<DEVICE_ID>","type":"unknown_agent","severity":"
 On macOS use `uuidgen | tr A-Z a-z` instead of `/proc/sys/kernel/random/uuid`. For a self-signed hub certificate
 add `-k` (testing only) or `--cacert hub-cert.pem` with the exported PEM.
 
+### 2.3 Device token
+
+- Format: 32 random bytes, base64url without padding (43 characters), generated only by the hub.
+- Issued once in the `/enroll` response as `device_token`. The hub stores only its SHA-256 hash (`devices.token_hash`); the
+  raw token cannot be shown again. A lost token means an admin `/reset <host>` and a new enroll (see `docs/OPERATIONS.md`).
+- Checked on `/heartbeat`, `/result`, `/event` against the hash of the `device_id` in the body, in constant time.
+  Failures: 401 `invalid device token` (header missing or wrong) and 401 `device not enrolled` (the device exists but has no
+  token, for example after a reset). An unknown `device_id` is still 404 `unknown device`.
+
 ## 3. Status codes
 
 | Code | Meaning | Typical cause |
 |---|---|---|
 | 200 | ok | |
 | 400 | bad request | malformed `X-SCG-Timestamp` or `X-SCG-Nonce`; empty or non-JSON body; missing/invalid field (`error` names it) |
-| 401 | unauthorized | missing or wrong bearer (body: `{"ok":false,"error":"unauthorized"}`) |
+| 401 | unauthorized | missing or wrong bearer (body: `{"ok":false,"error":"unauthorized"}`); on `/heartbeat`, `/result`, `/event`: `invalid device token` (header missing or wrong) or `device not enrolled` (device has no token, e.g. after `/reset`) |
 | 404 | not found | unknown route, or `unknown device` for an unknown `device_id` |
 | 405 | method not allowed | known path, wrong verb |
 | 408 | stale timestamp | `X-SCG-Timestamp` more than `max_skew_sec` (default 300 s) from hub time, in either direction. Check the endpoint's clock. |
-| 409 | conflict | replayed nonce; or `/enroll` for a hostname that is already enrolled and online; or `/result` for a command that was not dispatched to that device |
+| 409 | conflict | replayed nonce; or `/enroll` for a hostname that already holds a device token (`hostname already enrolled`); or `/result` for a command that was not dispatched to that device |
 | 413 | body too large | request body over 1 MB (1,048,576 bytes) |
 | 500 | internal error | generic body `{"ok":false,"error":"internal error"}`; the detail is only in the hub log (masked) |
 | 503 | unavailable | nonce store at capacity (`replay cache full`, fail closed), or the hub is saturated (more than 32 requests in flight; empty body, `Retry-After: 1`). Retry later. |
@@ -132,13 +154,15 @@ The hub evaluates a request in this fixed order and stops at the first failure:
    the request later fails on routing or body validation.
 3. **Route** - 404 or 405.
 4. **Body** - read up to 1 MB (413), must be valid non-empty JSON for POST (400).
-5. **Handler** - field validation (400), existence checks (404), state checks (409).
+5. **Handler** - field validation (400), existence checks (404), device token check on `/heartbeat`, `/result`, `/event`
+   (401), state checks (409).
 
 Consequences: an unauthenticated caller can never tell which routes exist (always 401); a wrong-secret request
 does not consume a nonce; every rejection at steps 1 to 4 is written to `audit_log` as `auth.reject` with a reason
 code (`bad_bearer`, `bad_replay_headers`, `stale_timestamp`, `replayed_nonce`, `replay_cache_full`,
-`route_not_found`, `method_not_allowed`, `body_too_large`, `bad_body`) and the caller IP. Neither the secret nor the
-bearer value is ever stored.
+`route_not_found`, `method_not_allowed`, `body_too_large`, `bad_body`) and the caller IP. Handler-level rejections are
+audited the same way with reasons `bad_device_token`, `device_not_enrolled` and `enroll_conflict`. Neither the secret, the
+bearer value nor any device token is ever stored.
 
 ## 5. Replay protection (summary)
 
@@ -155,14 +179,16 @@ Details and limits: `docs/SECURITY.md` section 5.
 ### 6.1 `/enroll`
 
 - All four fields are required, non-blank strings; `hostname` is at most 255 characters.
-- The hub keys devices by hostname. A new hostname creates a device and returns a new `device_id`.
-- If the hostname already exists **and the device is online** (`last_seen` within `stale_after_min`, default 5 min),
-  the answer is **409 `hostname already enrolled and online`** and an `auth.reject` audit row (`enroll_conflict`) is
-  written. This blocks a second machine, or an attacker holding the secret, from taking over a live identity.
-- If the existing device is stale/offline, re-enroll succeeds and returns the **same** `device_id` (audited as `enroll`
-  with `reenroll: true`).
-- The agent stores `device_id` in `agent.config.json`. If a later heartbeat gets `404 unknown device`, the agent clears
-  its `device_id` and enrolls again on its next cycle.
+- The hub keys devices by hostname. A new hostname creates a device, generates a token and returns `device_id` plus
+  `device_token` (once). Only the SHA-256 hash is stored.
+- If the hostname already exists **and holds a token**, the answer is **always 409 `hostname already enrolled`** (online or
+  not) and an `auth.reject` audit row (`enroll_conflict`) is written. A holder of the shared secret therefore cannot
+  re-enroll an existing device and cannot obtain its id.
+- If the hostname exists but has no token (an admin ran `/reset <host>`), enroll succeeds, returns the **same** `device_id`
+  and a **new** token (audited as `enroll` with `reenroll: true`). Old tokens stop working at the reset.
+- The agent stores `device_id` and `device_token` in `agent.config.json`. If a later call gets `404 unknown device` or
+  `401 device not enrolled`, the agent clears both and enrolls again on its next cycle. On a 409 it only logs that the
+  operator must `/reset` the device.
 
 ### 6.2 `/heartbeat`
 
@@ -218,7 +244,7 @@ anonymous load-balancer probe.
 
 ## 7. Device and command lifecycle values
 
-- `devices.status`: `active`, `stale` (set by the ticker after `stale_after_min`; a heartbeat or enroll reactivates it),
+- `devices.status`: `active`, `stale` (set by the ticker after `stale_after_min`; a heartbeat or re-enroll reactivates it),
   `quarantined` (reserved; no code path sets it in v1).
 - `commands.status`: `pending`, `dispatched`, `done`, `failed`, `timeout`.
 - Commands that stay `dispatched` (age counted from `dispatched_at`) or `pending` (from `created_at`) longer than

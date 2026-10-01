@@ -40,6 +40,9 @@ Target: Windows PowerShell 5.1 (also loads on 7).
 - `Start-ScgHttpServer -Url -Secret -Route -ReplayCache -OnReject -Thumbprint` / `Stop-ScgHttpServer` (listener loop; handlers run as `param($Request)` scriptblocks returning `@{Status=200;Body=<obj>}`; body ≤1 MB)
 - `Initialize-ScgTlsBinding -Port -Thumbprint` (netsh http add sslcert, idempotent)
 
+## Contract v2.0 interface additions
+Common: `New-ScgDeviceToken`, `Get-ScgTokenHash -Token`, `Test-ScgDeviceToken -Token -Hash`, `Add-ScgLogSecret -Secret` (adds to the masking list without touching the log path). Database: `Set-ScgDeviceToken -Path -DeviceId -TokenHash [-IfUnset]` (`-IfUnset` writes only when token_hash is empty, so two simultaneous enrolls of one hostname cannot silently overwrite each other's token; `/enroll` uses it), `Clear-ScgDeviceToken -Path -DeviceId`. Agent: `Invoke-HubApi -DeviceToken`. Telegram: `/reset <host>` (`Invoke-TgReset`), callbacks `a:reset:<id8>` and `rst:<id8>`.
+
 ## Contract v1.2 interface additions (already implemented)
 Database: `Get-ScgCommand -Path -CommandId [-DeviceId]`; `Sync-ScgScAgent -AllowEmpty`. HttpServer: exports `Invoke-ScgRequestPipeline`, `ConvertTo-ScgWorkerScriptBlock`, `ConvertTo-ScgWorkerConfig`; `Start-ScgHttpServer -MaxSkewSec -NonceTtlSec -MaxWorkers -WorkerModule -LogContext -TimeoutSec`; pipeline `-BodyProvider`. Discovery: `ConvertTo-ScAgentId`, `ConvertTo-ScAgentEntry`, `Test-ScAgentAuthorized`. Telegram: `Invoke-TgPollOnce`, `Send-TgResultNotice`. Hub handlers take `-RemoteIp`; `Start-ScgHub -NoWait`. **Hub deps also include Telegram.**
 

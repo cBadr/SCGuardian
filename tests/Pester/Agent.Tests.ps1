@@ -55,6 +55,7 @@ BeforeAll {
                 $captured = @{
                     Path = $req.Url.AbsolutePath; Method = $req.HttpMethod; Body = $body; ContentType = $req.ContentType
                     Auth = $req.Headers['Authorization']; Ts = $req.Headers['X-SCG-Timestamp']; Nonce = $req.Headers['X-SCG-Nonce']
+                    DevTok = $req.Headers['X-SCG-Device-Token']
                 }
                 $bytes = [System.Text.Encoding]::UTF8.GetBytes($text)
                 $ctx.Response.StatusCode = $status
@@ -104,6 +105,14 @@ Describe 'Get-ScgAgentConfig' {
         Write-TestConfig -Override @{ allowed_ids = @('not-an-id') }
         { Get-ScgAgentConfig -Path $script:Cfg } | Should -Throw
     }
+    It 'reads device_token and treats a blank token as null' {
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tok-cfg-0001' }
+        (Get-ScgAgentConfig -Path $script:Cfg).device_token | Should -Be 'tok-cfg-0001'
+        Write-TestConfig -Override @{ device_token = '  ' }
+        (Get-ScgAgentConfig -Path $script:Cfg).device_token | Should -BeNullOrEmpty
+        Write-TestConfig
+        (Get-ScgAgentConfig -Path $script:Cfg).device_token | Should -BeNullOrEmpty
+    }
     It 'rejects plain http to a non-loopback hub' {
         Write-TestConfig -Override @{ hub_url = 'http://hub.example.test' }
         { Get-ScgAgentConfig -Path $script:Cfg } | Should -Throw
@@ -131,6 +140,19 @@ Describe 'Update-ScgAgentConfig' {
         $f.scan_interval_sec | Should -Be 45
         $f.alert_throttle_min | Should -Be 15
         @($f.allowed_ids) | Should -Be @('aaaaaaaaaaaaaaaa', 'cccccccccccccccc')
+    }
+    It 'never adopts a pushed device_token or device_id' {
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tok-cfg-0001' }
+        $server = [pscustomobject]@{ heartbeat_sec = 90; device_token = 'evil-token'; device_id = 'evil-device' }
+        (Update-ScgAgentConfig -Path $script:Cfg -ServerConfig $server) | Should -BeTrue
+        $f = Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json
+        $f.device_token | Should -Be 'tok-cfg-0001'
+        $f.device_id | Should -Be 'dev-0001'
+        $f.heartbeat_sec | Should -Be 90
+        Write-TestConfig
+        (Update-ScgAgentConfig -Path $script:Cfg -ServerConfig ([pscustomobject]@{ device_token = 'evil-token' })) | Should -BeFalse
+        $g = Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json
+        $g.device_token | Should -BeNullOrEmpty
     }
     It 'returns false when nothing changed' {
         Write-TestConfig
@@ -388,7 +410,7 @@ Describe 'Invoke-ScgAgentCycle' {
         Mock Invoke-HubApi {
             $global:ScgTestOrder.Add($Path)
             switch ($Path) {
-                '/enroll' { return [pscustomobject]@{ ok = $true; device_id = 'dev-0001' } }
+                '/enroll' { return [pscustomobject]@{ ok = $true; device_id = 'dev-0001'; device_token = 'tok-new-0001' } }
                 '/heartbeat' { return [pscustomobject]@{ ok = $true; commands = @(); config = [pscustomobject]@{ heartbeat_sec = 60; scan_interval_sec = 30; allowed_ids = @('aaaaaaaaaaaaaaaa'); alert_throttle_min = 60 } } }
                 default { return [pscustomobject]@{ ok = $true } }
             }
@@ -426,9 +448,106 @@ Describe 'Invoke-ScgAgentCycle' {
         Should -Invoke Invoke-ScgLocalWatchdog -ModuleName Agent -Times 2 -Exactly
     }
     It 'clears device_id when the hub answers 404 so the next cycle re-enrolls' {
-        Write-TestConfig -Override @{ device_id = 'dev-0001' }
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tok-old-0001' }
         Mock Invoke-HubApi { throw 'hub http 404: unknown device' } -ModuleName Agent
         $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $f = Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json
+        $f.device_id | Should -BeNullOrEmpty
+        $f.device_token | Should -BeNullOrEmpty
+        (Get-Content -LiteralPath $script:StatePath -Raw | ConvertFrom-Json).consecutive_failures | Should -Be 1
+    }
+    It 'persists device_id and device_token from the enroll response and never logs the token' {
+        Write-TestConfig
+        $s = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $s.Enrolled | Should -BeTrue
+        $f = Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json
+        $f.device_id | Should -Be 'dev-0001'
+        $f.device_token | Should -Be 'tok-new-0001'
+        @(Get-ChildItem -LiteralPath $TestDrive -Filter '*.tmp').Count | Should -Be 0
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 0 -Exactly -ParameterFilter { "$Message $Target $Result" -like '*tok-new-0001*' }
+    }
+    It 'does not persist anything when the enroll response has no device_token' {
+        Write-TestConfig
+        Mock Invoke-HubApi {
+            if ($Path -eq '/enroll') { return [pscustomobject]@{ ok = $true; device_id = 'dev-0001' } }
+            return [pscustomobject]@{ ok = $true }
+        } -ModuleName Agent
+        $s = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $s.HubOk | Should -BeFalse
+        (Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json).device_id | Should -BeNullOrEmpty
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 0 -Exactly -ParameterFilter { $Path -eq '/heartbeat' }
+    }
+    It 'sends the device token on heartbeat, result and event but not on enroll' {
+        Write-TestConfig
+        Mock Get-ScAgent { @([pscustomobject]@{ Id = 'bbbbbbbbbbbbbbbb'; ServiceName = 'svcB'; ServiceState = 'Running'; StartMode = 'Auto'; Folder = $null; UninstallKey = $null; Authorized = $false }) } -ModuleName Agent
+        Mock ConvertTo-ScHeartbeatAgent { [pscustomobject]@{ id = 'bbbbbbbbbbbbbbbb' } } -ModuleName Agent
+        Mock Invoke-HubApi {
+            switch ($Path) {
+                '/enroll' { return [pscustomobject]@{ ok = $true; device_id = 'dev-0001'; device_token = 'tok-new-0001' } }
+                '/heartbeat' { return [pscustomobject]@{ ok = $true; commands = @([pscustomobject]@{ id = 'c1'; type = 'ping'; payload = $null }) } }
+                default { return [pscustomobject]@{ ok = $true } }
+            }
+        } -ModuleName Agent
+        $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq '/enroll' -and [string]::IsNullOrEmpty($DeviceToken) }
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq '/heartbeat' -and $DeviceToken -ceq 'tok-new-0001' }
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq '/result' -and $DeviceToken -ceq 'tok-new-0001' }
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq '/event' -and $DeviceToken -ceq 'tok-new-0001' }
+    }
+    It 'clears device_id and device_token on 401 device not enrolled and re-enrolls on the next cycle' {
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tok-old-0001' }
+        Mock Invoke-HubApi { throw 'hub http 401: device not enrolled' } -ModuleName Agent
+        $s = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $s.HubOk | Should -BeFalse
+        $f = Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json
+        $f.device_id | Should -BeNullOrEmpty
+        $f.device_token | Should -BeNullOrEmpty
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Level -eq 'INFO' -and $Result -eq 'reset' }
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 0 -Exactly -ParameterFilter { "$Message" -like '*tok-old-0001*' }
+        Mock Invoke-HubApi {
+            switch ($Path) {
+                '/enroll' { return [pscustomobject]@{ ok = $true; device_id = 'dev-0001'; device_token = 'tok-new-0002' } }
+                '/heartbeat' { return [pscustomobject]@{ ok = $true; commands = @() } }
+                default { return [pscustomobject]@{ ok = $true } }
+            }
+        } -ModuleName Agent
+        $s2 = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0.AddSeconds(5)
+        $s2.Enrolled | Should -BeTrue
+        $s2.HubOk | Should -BeTrue
+        (Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json).device_token | Should -Be 'tok-new-0002'
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq '/heartbeat' -and $DeviceToken -ceq 'tok-new-0002' }
+    }
+    It 'keeps the identity and never re-enrolls on 401 invalid device token' {
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tok-old-0001' }
+        Mock Invoke-HubApi { throw 'hub http 401: invalid device token' } -ModuleName Agent
+        $s = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $s.HubOk | Should -BeFalse
+        $f = Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json
+        $f.device_id | Should -Be 'dev-0001'
+        $f.device_token | Should -Be 'tok-old-0001'
+        $st = Get-Content -LiteralPath $script:StatePath -Raw | ConvertFrom-Json
+        $st.consecutive_failures | Should -Be 1
+        ((ConvertFrom-ScgUtcIso -Value $st.next_heartbeat_utc) - $script:T0).TotalSeconds | Should -Be 60
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -like '*invalid device token*operator must /reset*' }
+        $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0.AddSeconds(5)
+        $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0.AddSeconds(70)
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 0 -Exactly -ParameterFilter { $Path -eq '/enroll' }
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 2 -Exactly -ParameterFilter { $Path -eq '/heartbeat' }
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -like '*invalid device token*' }
+        (Get-Content -LiteralPath $script:StatePath -Raw | ConvertFrom-Json).consecutive_failures | Should -Be 2
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 0 -Exactly -ParameterFilter { "$Message" -like '*tok-old-0001*' }
+    }
+    It 'warns and backs off normally when enroll answers 409 hostname already enrolled' {
+        Write-TestConfig
+        Mock Invoke-HubApi { throw 'hub http 409: hostname already enrolled' } -ModuleName Agent
+        $s = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $s.HubOk | Should -BeFalse
+        $st = Get-Content -LiteralPath $script:StatePath -Raw | ConvertFrom-Json
+        $st.consecutive_failures | Should -Be 1
+        ((ConvertFrom-ScgUtcIso -Value $st.next_heartbeat_utc) - $script:T0).TotalSeconds | Should -Be 60
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Level -eq 'WARN' -and $Message -like '*hostname already enrolled; ask the operator to /reset this device*' }
+        $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0.AddSeconds(5)
+        Should -Invoke Invoke-HubApi -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq '/enroll' }
         (Get-Content -LiteralPath $script:Cfg -Raw | ConvertFrom-Json).device_id | Should -BeNullOrEmpty
     }
     It 'keeps device_id on a 404 that is not unknown device' {
@@ -556,7 +675,85 @@ Describe 'Invoke-ScgAgentCycle with the real watchdog' {
     }
 }
 
+Describe 'Invoke-ScgAgentCycle log masking with the real logger' {
+    BeforeEach {
+        Remove-Item -LiteralPath $script:StatePath -Force -ErrorAction SilentlyContinue
+        $script:MaskLog = Join-Path $TestDrive ('logs\mask-' + [guid]::NewGuid().ToString('N') + '.log')
+        InModuleScope Agent -Parameters @{ p = $script:MaskLog } { param($p) Set-ScgLogContext -Path $p -MaxBytes 10485760 -Secret @() }
+        Mock Initialize-ScgSecureDirectory { $true } -ModuleName Agent
+        Mock Invoke-ScgLocalWatchdog { return @() } -ModuleName Agent
+        Mock Test-ScTamper { $false } -ModuleName Agent
+        $script:T0 = [datetime]::SpecifyKind([datetime]'2026-01-01T10:00:00', [System.DateTimeKind]::Utc)
+    }
+    It 'masks a stored device token in every log line' {
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tokStoredSecret0001' }
+        Mock Get-ScAgent { throw 'cim failure tokStoredSecret0001' } -ModuleName Agent
+        Mock Invoke-HubApi { return [pscustomobject]@{ ok = $true; commands = @() } } -ModuleName Agent
+        $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $txt = Get-Content -LiteralPath $script:MaskLog -Raw
+        $txt | Should -Match 'discovery failed'
+        $txt | Should -Not -Match 'tokStoredSecret0001'
+    }
+    It 'masks a device token learned from enroll in later log lines' {
+        Write-TestConfig
+        Mock Get-ScAgent { throw 'cim failure tokEnrollSecret0002' } -ModuleName Agent
+        Mock Invoke-HubApi {
+            if ($Path -eq '/enroll') { return [pscustomobject]@{ ok = $true; device_id = 'dev-0001'; device_token = 'tokEnrollSecret0002' } }
+            return [pscustomobject]@{ ok = $true; commands = @() }
+        } -ModuleName Agent
+        $s = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $s.Enrolled | Should -BeTrue
+        $txt = Get-Content -LiteralPath $script:MaskLog -Raw
+        $txt | Should -Match 'Enrolled with hub'
+        $txt | Should -Match 'discovery failed'
+        $txt | Should -Not -Match 'tokEnrollSecret0002'
+    }
+    It 'masks the device token in the backoff warning when the hub echoes it' {
+        Write-TestConfig -Override @{ device_id = 'dev-0001'; device_token = 'tokEchoSecret0003' }
+        Mock Get-ScAgent { @() } -ModuleName Agent
+        Mock Invoke-HubApi { throw 'hub http 500: echo tokEchoSecret0003' } -ModuleName Agent
+        $null = Invoke-ScgAgentCycle -ConfigPath $script:Cfg -Now $script:T0
+        $txt = Get-Content -LiteralPath $script:MaskLog -Raw
+        $txt | Should -Match 'Hub exchange failed'
+        $txt | Should -Not -Match 'tokEchoSecret0003'
+    }
+}
+
 Describe 'Invoke-HubApi' {
+    It 'sends X-SCG-Device-Token only on heartbeat, result and event' {
+        $cases = @(
+            @{ Method = 'POST'; Path = '/heartbeat'; Expect = $true },
+            @{ Method = 'POST'; Path = '/result'; Expect = $true },
+            @{ Method = 'POST'; Path = '/event'; Expect = $true },
+            @{ Method = 'POST'; Path = '/enroll'; Expect = $false },
+            @{ Method = 'GET'; Path = '/health'; Expect = $false }
+        )
+        foreach ($c in $cases) {
+            $srv = Start-TestListener
+            $cfg = [pscustomobject]@{ hub_url = "http://127.0.0.1:$($srv.Port)"; shared_secret = 'sekret-123'; trusted_server_thumbprint = '' }
+            $null = Invoke-HubApi -Config $cfg -Method $c.Method -Path $c.Path -Body @{ device_id = 'd1' } -DeviceToken 'tok-hdr-0001'
+            $cap = Stop-TestListener -Server $srv
+            $cap.Path | Should -Be ('/api/v1' + $c.Path)
+            if ($c.Expect) { $cap.DevTok | Should -BeExactly 'tok-hdr-0001' }
+            else { $cap.DevTok | Should -BeNullOrEmpty }
+        }
+    }
+    It 'omits X-SCG-Device-Token when no token is given' {
+        $srv = Start-TestListener
+        $cfg = [pscustomobject]@{ hub_url = "http://127.0.0.1:$($srv.Port)"; shared_secret = 'sekret-123'; trusted_server_thumbprint = '' }
+        $null = Invoke-HubApi -Config $cfg -Method POST -Path '/heartbeat' -Body @{ device_id = 'd1' }
+        $cap = Stop-TestListener -Server $srv
+        $cap.DevTok | Should -BeNullOrEmpty
+    }
+    It 'masks the device token in an error message' {
+        $srv = Start-TestListener -Status 401 -ResponseText '{"ok":false,"error":"bad tok-hdr-0001"}'
+        $cfg = [pscustomobject]@{ hub_url = "http://127.0.0.1:$($srv.Port)"; shared_secret = 'sekret-123'; trusted_server_thumbprint = '' }
+        $msg = ''
+        try { $null = Invoke-HubApi -Config $cfg -Method POST -Path '/heartbeat' -Body @{ device_id = 'd1' } -DeviceToken 'tok-hdr-0001' } catch { $msg = $_.Exception.Message }
+        $null = Stop-TestListener -Server $srv
+        $msg | Should -Match 'hub http 401'
+        $msg | Should -Not -Match 'tok-hdr-0001'
+    }
     It 'sends a well-formed signed request (loopback listener)' {
         $srv = Start-TestListener -Status 200 -ResponseText '{"ok":true,"device_id":"d1"}'
         $cfg = [pscustomobject]@{ hub_url = "http://127.0.0.1:$($srv.Port)"; shared_secret = 'sekret-123'; trusted_server_thumbprint = '' }

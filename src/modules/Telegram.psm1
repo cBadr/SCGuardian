@@ -47,6 +47,7 @@ $script:TgHelpText = @'
 /remove &lt;host&gt; &lt;sc_id&gt; - remove an UNKNOWN agent (2-step confirm)
 /confirm &lt;code&gt; - confirm a pending removal
 /ping &lt;host&gt; - ping a device through the hub
+/reset &lt;host&gt; - revoke a device token so it re-enrolls (specific host only)
 /events [n] - latest events
 /audit [n] - latest audit entries
 /whoami - show your Telegram id
@@ -392,11 +393,11 @@ function New-TgMenu {
     <#
     .SYNOPSIS
     Builds an inline-keyboard reply_markup. Names: main, devices, device, remove-list, remove-confirm, back.
-    Context keys: devices {Devices,Page} | device {Device,HasUnknown} | remove-list {DeviceId8,UnknownId} | remove-confirm {DeviceId8,ScId} | back {Callback}.
+    Context keys: devices {Devices,Page} | device {Device,HasUnknown} | remove-list {DeviceId8,UnknownId} | remove-confirm {DeviceId8,ScId} | reset-confirm {DeviceId8} | back {Callback}.
     #>
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][ValidateSet('main', 'devices', 'device', 'remove-list', 'remove-confirm', 'back')][string]$Name,
+        [Parameter(Mandatory)][ValidateSet('main', 'devices', 'device', 'remove-list', 'remove-confirm', 'reset-confirm', 'back')][string]$Name,
         [hashtable]$Context = @{}
     )
     $i = $script:TgIcon
@@ -431,6 +432,7 @@ function New-TgMenu {
             [void]$rows.Add(@((New-TgButton 'Status' "a:status:$d8"), (New-TgButton "$($i.Harden) Harden" "a:harden:$d8")))
             [void]$rows.Add(@((New-TgButton 'Agents' "a:agents:$d8"), (New-TgButton 'Restore' "a:restore:$d8")))
             if ($Context.HasUnknown) { [void]$rows.Add(@((New-TgButton "$($i.Broom) Remove unknown" "a:listrm:$d8"))) }
+            [void]$rows.Add(@((New-TgButton 'Reset token' "a:reset:$d8")))
             [void]$rows.Add(@((New-TgButton "$($i.Back) Devices" 'm:devs')))
         }
         'remove-list' {
@@ -443,6 +445,11 @@ function New-TgMenu {
         'remove-confirm' {
             [void]$rows.Add(@(
                     (New-TgButton "$($i.Ok) CONFIRM remove" "rmc:$($Context.DeviceId8):$($Context.ScId)"),
+                    (New-TgButton "$($i.No) Cancel" "d:$($Context.DeviceId8)")))
+        }
+        'reset-confirm' {
+            [void]$rows.Add(@(
+                    (New-TgButton "$($i.Ok) CONFIRM reset" "rst:$($Context.DeviceId8)"),
                     (New-TgButton "$($i.No) Cancel" "d:$($Context.DeviceId8)")))
         }
         'back' {
@@ -520,6 +527,24 @@ function Invoke-TgIssue {
     $cid = New-ScgCommand -Path $Ctx.Path -DeviceId $did -Type $Type -Payload $Payload -IssuedBy $Ctx.Actor -IssuedVia 'telegram'
     Add-ScgAudit -Path $Ctx.Path -Actor $Ctx.Actor -Action $AuditAction -Target $host1 -Meta @{ type = $Type; command_id = "$cid" } | Out-Null
     return $cid
+}
+
+function Invoke-TgReset {
+    <#
+    .SYNOPSIS
+    Revokes a device token (Clear-ScgDeviceToken), audits device.reset, returns the HTML reply. Returns @{Ok;Text}.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][hashtable]$Ctx, [Parameter(Mandatory)][object]$Device)
+    $did = [string](Get-TgField -Row $Device -Name @('id', 'device_id'))
+    $host1 = [string](Get-TgField -Row $Device -Name @('hostname') -Default $did)
+    $hostHtml = ConvertTo-TgHtml $host1
+    $cleared = Clear-ScgDeviceToken -Path $Ctx.Path -DeviceId $did
+    if (-not $cleared) { return @{ Ok = $false; Text = ("Reset failed for <b>{0}</b>: no token was cleared." -f $hostHtml) } }
+    Add-ScgAudit -Path $Ctx.Path -Actor $Ctx.Actor -Action 'device.reset' -Target $did -Meta @{ hostname = $host1 } | Out-Null
+    $txt = ("Token of <b>{0}</b> was revoked. The agent will re-enroll on its next cycle.`n" -f $hostHtml) +
+    "WARNING: until it re-enrolls, anyone holding the fleet secret could claim this hostname. Watch /events."
+    return @{ Ok = $true; Text = $txt }
 }
 
 function Format-TgDeviceLine {
@@ -818,6 +843,14 @@ function Invoke-TgMessageCommand {
             if (-not $r.Ok) { Invoke-TgSend -Ctx $Ctx -Text $r.Error; return }
             Invoke-TgSend -Ctx $Ctx -Text ("Removal of <code>{0}</code> queued for <b>{1}</b>." -f $r.ScId, (ConvertTo-TgHtml $r.Hostname))
         }
+        '/reset' {
+            if (-not $a0) { Invoke-TgSend -Ctx $Ctx -Text 'usage: /reset &lt;host&gt;'; return }
+            if ($a0 -ieq 'all') { Invoke-TgSend -Ctx $Ctx -Text 'refused: /reset needs a specific host.'; return }
+            $dev = Resolve-TgDevice -Ctx $Ctx -Name $a0
+            if (-not $dev) { Invoke-TgSend -Ctx $Ctx -Text ("Unknown host: <code>{0}</code>" -f (ConvertTo-TgHtml $a0)); return }
+            $r = Invoke-TgReset -Ctx $Ctx -Device $dev
+            Invoke-TgSend -Ctx $Ctx -Text $r.Text
+        }
         '/events' { Invoke-TgSend -Ctx $Ctx -Text (Format-TgEventText -Ctx $Ctx -Last (Get-TgCount -Argument $arg)) }
         '/audit' { Invoke-TgSend -Ctx $Ctx -Text (Format-TgAuditText -Ctx $Ctx -Last (Get-TgCount -Argument $arg)) }
         default { Invoke-TgSend -Ctx $Ctx -Text ("unknown command: {0} - try /help" -f (ConvertTo-TgHtml $cmd)) }
@@ -875,6 +908,9 @@ function Invoke-TgCallback {
                     if ($p1 -eq 'status') { $txt = (Format-TgDeviceLine -Device $dev) + "`nstatus check queued" }
                     Invoke-TgSend -Ctx $Ctx -Text $txt -Markup (& $deviceMenu $dev) -EditMessageId $mid
                 }
+                'reset' {
+                    Invoke-TgSend -Ctx $Ctx -Text ("Revoke the device token of <b>{0}</b>?`nThe agent will re-enroll on its next cycle." -f $name) -Markup (New-TgMenu -Name 'reset-confirm' -Context @{ DeviceId8 = (Get-TgDeviceId8 -Device $dev) }) -EditMessageId $mid
+                }
                 'listrm' {
                     $unknown = Get-TgUnknownAgent -Ctx $Ctx -Device $dev
                     Invoke-TgSend -Ctx $Ctx -Text ("<b>Unknown agents on {0}</b>`npick one to remove:" -f $name) -Markup (New-TgMenu -Name 'remove-list' -Context @{ DeviceId8 = (Get-TgDeviceId8 -Device $dev); UnknownId = $unknown }) -EditMessageId $mid
@@ -887,6 +923,12 @@ function Invoke-TgCallback {
             $r = Request-TgRemove -Ctx $Ctx -Device $dev -ScId $p2
             if (-not $r.Ok) { Invoke-TgSend -Ctx $Ctx -Text $r.Error -Markup (New-TgMenu -Name 'back' -Context @{ Callback = "d:$p1" }) -EditMessageId $mid; return }
             Invoke-TgSend -Ctx $Ctx -Text ("Remove agent <code>{0}</code> on <b>{1}</b>?`nTap CONFIRM within {2} s." -f $r.ScId, (ConvertTo-TgHtml (Get-TgField -Row $dev -Name @('hostname'))), $Ctx.ConfirmSec) -Markup (New-TgMenu -Name 'remove-confirm' -Context @{ DeviceId8 = $p1; ScId = $r.ScId }) -EditMessageId $mid
+        }
+        'rst' {
+            $dev = Resolve-TgDevice -Ctx $Ctx -Name $p1 -ByIdPrefix
+            if (-not $dev) { Invoke-TgSend -Ctx $Ctx -Text 'Device not found.' -Markup (New-TgMenu -Name 'back' -Context @{ Callback = 'm:devs' }) -EditMessageId $mid; return }
+            $r = Invoke-TgReset -Ctx $Ctx -Device $dev
+            Invoke-TgSend -Ctx $Ctx -Text $r.Text -Markup (New-TgMenu -Name 'back' -Context @{ Callback = "d:$p1" }) -EditMessageId $mid
         }
         'rmc' {
             $r = Complete-TgRemove -Ctx $Ctx -SkipCode -DeviceId8 $p1 -ScId $p2

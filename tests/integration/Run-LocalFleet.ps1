@@ -123,6 +123,17 @@ try {
         $w | Add-Member -NotePropertyName DeviceId -NotePropertyValue $id
     }
 
+    # 1b. per-device tokens: agent config holds the raw token, DB only a 64-hex hash
+    $tokOk = Wait-Condition -Seconds $TimeoutSec -Condition { @($workers | Where-Object { -not (Get-ScgTestAgentToken -ConfigPath $_.Config) }).Count -eq 0 }
+    foreach ($w in $workers) { $w | Add-Member -NotePropertyName Token -NotePropertyValue (Get-ScgTestAgentToken -ConfigPath $w.Config) -Force }
+    Write-Check 'every agent.config.json holds a device_token' ($tokOk -and (@($workers | Where-Object { $_.Token.Length -lt 20 }).Count -eq 0))
+    $devs = @(Get-ScgDevice -Path $db)
+    $hashBad = @($devs | Where-Object { ([string]$_.token_hash) -notmatch '^[0-9a-f]{64}$' })
+    $rawInDb = @($workers | Where-Object { $t = $_.Token; $t -and (@($devs | Where-Object { ([string]$_.token_hash) -eq $t }).Count -gt 0) })
+    Write-Check 'DB holds only 64-hex token_hash (no raw token)' (($hashBad.Count -eq 0) -and ($rawInDb.Count -eq 0)) ('bad hashes: ' + $hashBad.Count)
+    $uniq = @($workers | ForEach-Object { $_.Token } | Select-Object -Unique).Count
+    Write-Check 'each agent has a distinct token' ($uniq -eq $Agents)
+
     # 2. mock Telegram: /devices
     $sent = New-Object System.Collections.ArrayList
     $send = { param($Text, $Markup, $ChatId, $EditMessageId) [void]$sent.Add([pscustomobject]@{ Text = [string]$Text; Markup = (ConvertTo-Json -InputObject $Markup -Depth 10 -Compress) }) }.GetNewClosure()
@@ -177,6 +188,50 @@ try {
     Write-Check 'replayed nonce returns 409' ($h2.Status -eq 409) ("status=$($h2.Status)")
     $h3 = Invoke-ScgTestRequest -Url ($base + '/api/v1/health') -Bearer ('wrong-' + $secret.Substring(0, 8)) -Thumbprint $certThumb
     Write-Check 'wrong bearer returns 401 with no data' (($h3.Status -eq 401) -and ($h3.Text -notmatch 'devices_online|uptime_sec|commands_pending|version')) ("status=$($h3.Status)")
+
+    # 8. device token enforcement on raw heartbeats
+    $vic = $workers[0]
+    $oth = $workers[1]
+    $hbBody = { param($w) @{ device_id = $w.DeviceId; hostname = $w.Host; sc_agents = @(); uptime_sec = 1; agent_version = '0.0.0-it' } }
+    $r1 = Invoke-ScgTestRequest -Url ($base + '/api/v1/heartbeat') -Method POST -Bearer $secret -Body (& $hbBody $vic) -Thumbprint $certThumb
+    Write-Check 'heartbeat without X-SCG-Device-Token returns 401' ($r1.Status -eq 401) ("status=$($r1.Status)")
+    $r2 = Invoke-ScgTestRequest -Url ($base + '/api/v1/heartbeat') -Method POST -Bearer $secret -Body (& $hbBody $vic) -Thumbprint $certThumb -Headers @{ 'X-SCG-Device-Token' = $oth.Token }
+    Write-Check "heartbeat with another device's token returns 401 and leaks nothing" (($r2.Status -eq 401) -and ($r2.Text -notmatch '"commands"|allowed_ids|scan_interval_sec')) ("status=$($r2.Status)")
+    $r3 = Invoke-ScgTestRequest -Url ($base + '/api/v1/heartbeat') -Method POST -Bearer $secret -Body (& $hbBody $vic) -Thumbprint $certThumb -Headers @{ 'X-SCG-Device-Token' = 'x' * 43 }
+    Write-Check 'heartbeat with a garbage token returns 401' ($r3.Status -eq 401) ("status=$($r3.Status)")
+
+    # 9. duplicate raw /enroll for an enrolled hostname
+    $enBody = @{ hostname = $vic.Host; os = 'Windows'; os_version = '10.0'; agent_version = '0.0.0-it' }
+    $e1 = Invoke-ScgTestRequest -Url ($base + '/api/v1/enroll') -Method POST -Bearer $secret -Body $enBody -Thumbprint $certThumb
+    Write-Check 'second /enroll for an enrolled hostname returns 409 without a token' (($e1.Status -eq 409) -and ($e1.Text -notmatch 'device_token')) ("status=$($e1.Status)")
+    $hbBefore = [string](@(Get-ScgDevice -Path $db -DeviceId $vic.DeviceId) | Select-Object -First 1).last_seen
+    $kept = Wait-Condition -Seconds $TimeoutSec -Condition { [string](@(Get-ScgDevice -Path $db -DeviceId $vic.DeviceId) | Select-Object -First 1).last_seen -ne $hbBefore }
+    Write-Check 'existing agent keeps working after the rejected enroll' ($kept -and ((Get-ScgTestAgentToken -ConfigPath $vic.Config) -eq $vic.Token))
+
+    # 10. admin /reset <host>: 401 device not enrolled, re-enroll, NEW token, old token dead
+    $oldTok = $vic.Token
+    Invoke-TgRouter -Update (New-ScgTestTgUpdate -Text ('/reset ' + $vic.Host) -FromId $adminId -ChatId $chatId -UpdateId ($uid++)) -Config $cfg -Send $send
+    $rej = Wait-Condition -Seconds $TimeoutSec -Condition {
+        @(Invoke-ScgSql -Path $db -Sql "SELECT id FROM audit_log WHERE action='auth.reject' AND meta_json LIKE '%device_not_enrolled%'").Count -ge 1
+    }
+    Write-Check 'reset agent is answered 401 device not enrolled (audit)' $rej
+    $newTok = ''
+    $renew = Wait-Condition -Seconds $TimeoutSec -Condition {
+        $t = Get-ScgTestAgentToken -ConfigPath $vic.Config
+        $d = @(Get-ScgDevice -Path $db -DeviceId $vic.DeviceId) | Select-Object -First 1
+        $t -and ($t -ne $oldTok) -and $d -and ([string]$d.token_hash -match '^[0-9a-f]{64}$')
+    }
+    $newTok = Get-ScgTestAgentToken -ConfigPath $vic.Config
+    Write-Check 'agent re-enrolled and received a NEW token' ($renew -and $newTok -and ($newTok -ne $oldTok))
+    $r4 = Invoke-ScgTestRequest -Url ($base + '/api/v1/heartbeat') -Method POST -Bearer $secret -Body (& $hbBody $vic) -Thumbprint $certThumb -Headers @{ 'X-SCG-Device-Token' = $oldTok }
+    Write-Check 'old token is rejected with 401 after re-enroll' ($r4.Status -eq 401) ("status=$($r4.Status)")
+    $stillDev = @(Get-ScgDevice -Path $db | Where-Object { [string]$_.hostname -eq $vic.Host }).Count
+    Write-Check 're-enroll reuses the same device row' ($stillDev -eq 1)
+
+    # 11. raw tokens never reach logs
+    $allTokens = @($workers | ForEach-Object { $_.Token }) + @($newTok) | Where-Object { $_ } | Select-Object -Unique
+    $leakedTok = @($allTokens | Where-Object { Test-ScgTestTextContains -Root @($root) -Needle $_ })
+    Write-Check 'no raw device token appears in hub or agent logs' ($leakedTok.Count -eq 0) ('leaked: ' + $leakedTok.Count)
 }
 catch {
     $script:Fail++

@@ -10,7 +10,8 @@
     or use only functions from modules passed via Start-ScgHttpServer -WorkerModule (no closure variables).
     Route table convention: hashtable whose keys are "METHOD /path" (for example "POST /heartbeat",
     path relative to /api/v1) and whose values are scriptblocks taking param($Request) and returning
-    @{Status=<int>; Body=<object>}. $Request has Method, Path, Body (parsed JSON), RemoteIp.
+    @{Status=<int>; Body=<object>}. $Request has Method, Path, Body (parsed JSON), RemoteIp and Headers
+    (case-insensitive hashtable of request headers, Authorization excluded; v2.0 device token lives here).
 #>
 
 Set-StrictMode -Version 2.0
@@ -254,6 +255,30 @@ function Get-ScgHeaderValue {
     return $null
 }
 
+function ConvertTo-ScgHeaderTable {
+<#
+.SYNOPSIS
+    Copies request headers into a case-insensitive hashtable for handlers (Authorization is never copied).
+.PARAMETER Headers
+    Dictionary or NameValueCollection (may be null).
+#>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param($Headers)
+    $table = New-Object System.Collections.Hashtable ([System.StringComparer]::OrdinalIgnoreCase)
+    if ($null -eq $Headers) { return $table }
+    $keys = @()
+    if ($Headers -is [System.Collections.Specialized.NameValueCollection]) { $keys = @($Headers.AllKeys) }
+    elseif ($Headers -is [System.Collections.IDictionary]) { $keys = @($Headers.Keys) }
+    foreach ($k in $keys) {
+        if ($null -eq $k) { continue }
+        $name = [string]$k
+        if ($name -ieq 'Authorization') { continue }
+        $table[$name] = [string]$Headers[$k]
+    }
+    return $table
+}
+
 function New-ScgErrorResult {
 <#
 .SYNOPSIS
@@ -412,6 +437,7 @@ function Invoke-ScgRequestPipeline {
         Path     = (ConvertTo-ScgRoutePath -Path $rawPath)
         Body     = $parsed
         RemoteIp = $RemoteIp
+        Headers  = (ConvertTo-ScgHeaderTable -Headers $Headers)
     }
     try {
         $out = @(& $routeHit.Handler $request)

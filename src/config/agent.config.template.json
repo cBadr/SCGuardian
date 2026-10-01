@@ -2,6 +2,7 @@
   "hub_url": "https://ostazna.pro:8443",
   "shared_secret": "REPLACE_ME",
   "device_id": null,
+  "device_token": null,
   "hostname": "AUTO",
   "heartbeat_sec": 60,
   "scan_interval_sec": 60,

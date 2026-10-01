@@ -14,8 +14,10 @@ Describe 'Database' {
     }
 
     Context 'Migrations' {
-        It 'applies migrations 1 and 2 and records schema_version' {
-            Get-ScgSchemaVersion -Path $script:Db | Should -Be 2
+        It 'applies migrations 1 to 3 and records schema_version' {
+            Get-ScgSchemaVersion -Path $script:Db | Should -Be 3
+            $cols = @(Invoke-ScgSql -Path $script:Db -Sql "SELECT name FROM pragma_table_info('devices')" | ForEach-Object { $_.name })
+            $cols | Should -Contain 'token_hash'
             $t = @(Invoke-ScgSql -Path $script:Db -Sql "SELECT name FROM sqlite_master WHERE type='table'" | ForEach-Object { $_.name })
             foreach ($n in 'schema_version', 'devices', 'sc_agents', 'commands', 'events', 'audit_log') {
                 $t | Should -Contain $n
@@ -26,10 +28,17 @@ Describe 'Database' {
             }
         }
         It 'is idempotent' {
-            Invoke-ScgMigration -Path $script:Db | Should -Be 2
-            Invoke-ScgMigration -Path $script:Db | Should -Be 2
+            Invoke-ScgMigration -Path $script:Db | Should -Be 3
+            Invoke-ScgMigration -Path $script:Db | Should -Be 3
             $r = @(Invoke-ScgSql -Path $script:Db -Sql 'SELECT COUNT(*) AS n FROM schema_version')
-            $r[0].n | Should -Be 2
+            $r[0].n | Should -Be 3
+        }
+        It 'migration 3 skips the column when it already exists' {
+            $old = Join-Path $TestDrive ('m' + [guid]::NewGuid().ToString('N') + '.db')
+            [void](Initialize-ScgDatabase -Path $old)
+            [void](Invoke-ScgSql -Path $old -NonQuery -Sql 'DELETE FROM schema_version WHERE version=3')
+            Invoke-ScgMigration -Path $old | Should -Be 3
+            @(Invoke-ScgSql -Path $old -Sql "SELECT name FROM pragma_table_info('devices') WHERE name='token_hash'").Count | Should -Be 1
         }
         It 'enables foreign keys per connection' {
             $r = @(Invoke-ScgSql -Path $script:Db -Sql 'PRAGMA foreign_keys')
@@ -45,6 +54,23 @@ Describe 'Database' {
             $b.os_version | Should -Be '11'
             $b.status | Should -Be 'active'
             @(Get-ScgDevice -Path $script:Db).Count | Should -Be 1
+        }
+        It 'stores and clears the token hash and keeps the id on re-register' {
+            $a = Register-ScgDevice -Path $script:Db -Hostname 'PC1'
+            $a.PSObject.Properties.Name | Should -Contain 'token_hash'
+            $a.token_hash | Should -BeNullOrEmpty
+            $h = ('AB' * 32)
+            Set-ScgDeviceToken -Path $script:Db -DeviceId $a.id -TokenHash $h -IfUnset | Should -BeTrue
+            Set-ScgDeviceToken -Path $script:Db -DeviceId $a.id -TokenHash ('cd' * 32) -IfUnset | Should -BeFalse
+            @(Get-ScgDevice -Path $script:Db -DeviceId $a.id)[0].token_hash | Should -BeExactly ('ab' * 32)
+            $b = Register-ScgDevice -Path $script:Db -Hostname 'PC1' -Os 'Windows'
+            $b.id | Should -Be $a.id
+            $b.token_hash | Should -BeExactly ('ab' * 32)
+            Clear-ScgDeviceToken -Path $script:Db -DeviceId $a.id | Should -BeTrue
+            @(Get-ScgDevice -Path $script:Db -Hostname 'PC1')[0].token_hash | Should -BeNullOrEmpty
+            Clear-ScgDeviceToken -Path $script:Db -DeviceId 'nope' | Should -BeFalse
+            Set-ScgDeviceToken -Path $script:Db -DeviceId 'nope' -TokenHash $h | Should -BeFalse
+            { Set-ScgDeviceToken -Path $script:Db -DeviceId $a.id -TokenHash 'plain-token' } | Should -Throw
         }
         It 'updates seen and status, and looks up by id prefix' {
             $a = Register-ScgDevice -Path $script:Db -Hostname 'PC1'
@@ -143,8 +169,8 @@ Describe 'Database' {
                 "INSERT INTO sc_agents (id, device_id, service_name, authorized, state, first_seen, last_seen) VALUES ('0123456789abcdef', 'd1', 'S', 1, 'Running', 'x', 'x')"
             )
             foreach ($s in $ddl) { [void](Invoke-ScgSql -Path $old -NonQuery -Sql $s) }
-            Invoke-ScgMigration -Path $old | Should -Be 2
-            Invoke-ScgMigration -Path $old | Should -Be 2
+            Invoke-ScgMigration -Path $old | Should -Be 3
+            Invoke-ScgMigration -Path $old | Should -Be 3
             $rows = @(Get-ScgScAgent -Path $old -DeviceId 'd1')
             $rows.Count | Should -Be 1
             $rows[0].state | Should -Be 'Running'

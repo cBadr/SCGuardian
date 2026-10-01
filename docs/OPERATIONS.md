@@ -26,7 +26,9 @@ The full procedure is in `hub-deploy/README.md`; this is the short version.
    registered but not started.
 3. Edit `hub.config.json`: `shared_secret`, `telegram.bot_token`, `telegram.chat_id`, `telegram.admin_user_ids`,
    `defaults.allowed_ids`.
-4. Certificate: `.\cert-setup.ps1 -Domain ostazna.pro -Port 8443` (Let's Encrypt via win-acme) or `.\cert-setup.ps1 -SelfSigned`.
+4. Certificate: `.\cert-setup.ps1 -SelfSigned` (RSA 2048, 5 years) is the **recommended choice for fleets**, combined with `THUMBPRINT` on every agent.
+   `.\cert-setup.ps1 -Domain ostazna.pro -Port 8443` (Let's Encrypt via win-acme) works, but its leaf thumbprint changes at each renewal and would
+   disconnect every pinned agent, so do not pin a Let's Encrypt certificate unless you accept a fleet re-deploy at each renewal.
 5. `Start-ScheduledTask -TaskName SCGuardian-Hub`, then verify with the signed `GET /health` call in `docs/API.md`.
 
 Rules:
@@ -82,11 +84,15 @@ restart on failure). Uninstall removes the task and keeps `C:\ProgramData\SCGuar
 Interactive alternative: `installer\Setup.ps1` prompts for the URL and (masked) secret, installs silently and forces one
 heartbeat. Building the MSI is described in `installer/README.md` (WiX v4).
 
+On its first cycle the agent enrolls with the shared secret, receives its `device_id` and a one-time `device_token`, and stores both in
+`agent.config.json` (ACL-locked). Every later call carries the token. **Reinstalling a machine under the same hostname requires
+`/reset <host>` first** (section 6.2), otherwise the hub answers 409 `hostname already enrolled`.
+
 Check on the endpoint:
 
 ```powershell
 Get-ScheduledTask -TaskName SCGuardian-Agent | Get-ScheduledTaskInfo
-(Get-Content C:\ProgramData\SCGuardian\agent.config.json -Raw | ConvertFrom-Json).device_id   # filled after the first enroll
+(Get-Content C:\ProgramData\SCGuardian\agent.config.json -Raw | ConvertFrom-Json).device_id   # filled after the first enroll (never print device_token)
 Get-Content C:\ProgramData\SCGuardian\logs\scguardian.log -Tail 30
 ```
 
@@ -140,9 +146,12 @@ The secret is visible to Intune administrators inside the install command. Restr
 
 - `GET /health` -> `devices_online`; Telegram `/devices` or `/status all` for the fleet.
 - Never deploy to the hub machine.
-- A host that was already online under the same hostname makes `/enroll` answer 409; see troubleshooting.
+- A hostname that already holds a device token makes `/enroll` answer 409 (online or not); see section 6.2 and troubleshooting.
 
 ## 3. Rotate the shared secret
+
+Scope: since contract v2.0 the shared secret guards **enrollment** and is the transport credential on every request; device identity is the
+per-device token. Rotating the secret does not change device tokens, so no device needs re-enrolling (`/reset` is not part of rotation).
 
 **Honest limitation: v1 has no dual-secret window.** The hub accepts exactly one `shared_secret`, and the agents' secret
 is never pushed from the hub (by design). Between the moment the hub restarts with the new secret and the moment an agent
@@ -190,7 +199,8 @@ restart the hub. Agents are unaffected.
 
 The hub opens a short-lived connection per operation (WAL mode), so the database is usually checkpointed, but a safe copy must
 include the `-wal` and `-shm` files or be taken with the SQLite backup API. Always back up `hub.config.json` too. It holds
-the secrets; store the backup with the same restricted ACL (SYSTEM + Administrators).
+the secrets; store the backup with the same restricted ACL (SYSTEM + Administrators). `hub.db` holds the device token hashes, so a restore
+brings back the tokens that were valid at backup time; devices enrolled or reset since then need `/reset <host>`.
 
 ### 4.1 Stop-and-copy (matches `hub-deploy/README.md`)
 
@@ -250,7 +260,7 @@ stale `hub.db-wal`/`hub.db-shm` that do not belong to it) in place, start the ta
 
 Only one rotated generation is kept, so disk use is bounded at roughly twice `max_bytes` per log. If you need longer
 retention, copy the `.1` files to your archive on a schedule. Log lines are `UTC [LEVEL] actor= target= action= result= message`,
-CR/LF stripped, and pass through `Protect-Secret`: the shared secret, `Bearer <x>` and Telegram bot tokens appear as `***`.
+CR/LF stripped, and pass through `Protect-Secret`: the shared secret, the device token, `Bearer <x>` and Telegram bot tokens appear as `***`.
 Events, commands and audit rows are never pruned in v1; plan a manual retention job (for example delete audit rows older than a
 year after archiving them).
 
@@ -270,6 +280,7 @@ The bot only reacts in the chat whose id equals `telegram.chat_id`, and only to 
 | `/harden <host\|all>` | queues `harden` on one host or every device |
 | `/restore <host>` | queues `restore` (undo hardening of my agents) on one host |
 | `/ping <host>` | queues `ping`; the agent answers `pong` |
+| `/reset <host>` | revokes the device token of that host (a specific host only, `all` is refused); the agent re-enrolls on its next cycle. Also the "Reset token" button on the device card, with a CONFIRM step |
 | `/remove <host> <sc_id>` | step 1 of removing an UNKNOWN agent |
 | `/confirm <code>` | step 2 of removal |
 | `/events [n]` | latest events (default 10, maximum 20) |
@@ -312,18 +323,42 @@ Rules enforced in code:
 - The agent re-checks on its side: it refuses allow-listed ids, exports registry backups into `Backup\removed_<id>\` first and
   aborts (removing nothing) if a backup export fails. The result output starts with `refused:` or `aborted:` in those cases.
 
+### 6.2 `/reset <host>`: revoke a device token
+
+```
+you:  /reset PC-FRONTDESK
+bot:  (token revoked; audit device.reset)
+agent (next cycle): hub http 401 device not enrolled -> clears device_id and device_token -> POST /enroll -> new token
+```
+
+What it does: sets the host's `token_hash` to NULL in `hub.db` and audits `device.reset`. The old token stops working at once. The agent
+clears `device_id` and `device_token` from `agent.config.json` and re-enrolls on its next cycle (default within about 60 s), keeping the same
+`device_id` (history is preserved) and receiving a new token. From the reset until that re-enroll, the hostname can be claimed by anyone holding the shared secret
+(see `docs/SECURITY.md` 2.4), so check `/devices` afterwards.
+
+Use it when:
+
+- **A machine is reinstalled or re-imaged** (the new install has no token): run `/reset <host>` **before** installing the agent again.
+- **Token theft is suspected** (a copied `agent.config.json`, a compromised endpoint backup): reset, then review `/audit` for `enroll` rows with `reenroll: true`.
+- **The agent log shows `hub http 409: hostname already enrolled`** (or "ask the operator to /reset this device"): the agent lost its token while the hub still holds
+  the hash. Run `/reset <host>`; the agent re-enrolls by itself.
+
+If the host is offline, the reset still takes effect immediately; the agent re-enrolls when it next comes online.
+
 ## 7. Troubleshooting
 
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | Hub task not running | config still has `REPLACE_ME`, invalid config, port in use | `Get-ScheduledTaskInfo -TaskName SCGuardian-Hub`; read `hub.log`; config errors list every problem (never the values) |
-| Agent log: `hub http 401` | wrong or rotated secret | compare the agent's `shared_secret` with the hub's; see section 3 |
+| Agent log: `hub http 401` (plain `unauthorized`) | wrong or rotated shared secret | compare the agent's `shared_secret` with the hub's; see section 3 |
 | `hub http 408` | clock skew above `max_skew_sec` (default 300 s) | fix time sync (NTP/w32time) on the endpoint or hub |
-| `hub http 409: hostname already enrolled and online` | another machine, or a cloned image, uses the same hostname; or an agent lost its `device_id` while still seen within `stale_after_min` | rename the machine, or wait `stale_after_min` (5 min) without heartbeats from the old identity, then restart the agent |
+| `hub http 409: hostname already enrolled` | the hostname already holds a device token: the machine was reinstalled, the agent lost its token, or another machine or cloned image uses the same hostname | if it is the same machine: `/reset <host>` (section 6.2), the agent re-enrolls by itself. If it is a different machine: rename it |
+| `hub http 401: invalid device token` | wrong or missing `X-SCG-Device-Token`: stale or hand-edited `agent.config.json`, or a restored hub database with older hashes | `/reset <host>`; the agent then re-enrolls |
+| `hub http 401: device not enrolled` | the device was reset (or has no token) | none needed: the agent clears `device_id` and `device_token` and re-enrolls on the next cycle |
 | `hub http 409: replayed nonce` | request repeated by a proxy/retry layer, or nonce reuse in a custom script | do not retry with the same headers; build fresh headers each call |
 | `hub http 404: unknown device` | hub database was restored/replaced | none needed: the agent clears its `device_id` and re-enrolls on the next cycle |
 | `hub http 503` / `replay cache full` | more than 10,000 live nonces in the hub (about 17 requests per second sustained), or more than 32 requests in flight | wait and retry; reduce request rate (raise `heartbeat_sec`); see `docs/SECURITY.md` |
-| TLS error from the agent | certificate untrusted, expired, or pin mismatch | check `trusted_server_thumbprint` equals the hub certificate; on the hub `netsh http show sslcert ipport=0.0.0.0:8443` |
+| TLS error from the agent | certificate untrusted, expired, or pin mismatch (a renewed Let's Encrypt certificate changes the pinned thumbprint; fleets should use the 5-year self-signed certificate) | check `trusted_server_thumbprint` equals the hub certificate; on the hub `netsh http show sslcert ipport=0.0.0.0:8443` |
 | `trusted_server_thumbprint not set` warning in agent log | pinning not configured (dev mode) | set it (section 2) |
 | Agent offline but hardening still applied | expected: local watchdog runs without the hub | fix connectivity; nothing is lost |
 | Device shows `stale` | no heartbeat for `stale_after_min` (5 min) | check the endpoint's `SCGuardian-Agent` task and log; a heartbeat reactivates it |

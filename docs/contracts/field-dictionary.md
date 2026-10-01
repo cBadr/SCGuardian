@@ -52,6 +52,19 @@ Server-pushable (Hub → agent): `heartbeat_sec` `scan_interval_sec` `allowed_id
 ## Agent local state — `agent.state.json` (agent-only)
 `consecutive_failures` · `next_heartbeat_utc` · `last_failure_log_utc` · `alerts{<key>:<utc>}`
 
+## Per-device tokens (v2.0, FROZEN — supersedes the v1.1 "enroll online/stale" rule)
+Goal: a stolen fleet-wide shared secret can no longer impersonate an existing device.
+- DB: `devices.token_hash TEXT NULL` = lowercase hex SHA-256 of the raw token. Migration 3 (`ALTER TABLE devices ADD COLUMN token_hash TEXT`), schema_version → 3. The raw token is NEVER stored or logged.
+- Token: 32 random bytes (RNGCryptoServiceProvider) → base64url without padding (43 chars). Generated only by the Hub, returned ONCE in the `/enroll` response as `device_token`.
+- Header `X-SCG-Device-Token` is REQUIRED on `/heartbeat`, `/result`, `/event` (not on `/enroll`, `/health`). Verified against `token_hash` of the `device_id` in the body, constant-time. Wrong/missing → 401 `invalid device token`; device exists but `token_hash` is NULL → 401 `device not enrolled`; unknown device_id → 404 `unknown device` (unchanged). Each failure audits `auth.reject` (reason `bad_device_token` | `device_not_enrolled`), never the token.
+- `/enroll`: new hostname → create device, issue token, store hash. Existing hostname with `token_hash` set → **409 always** (`hostname already enrolled`, audit `auth.reject` reason `enroll_conflict`). Existing hostname with `token_hash` NULL → same `device_id`, issue a NEW token (audit `enroll` meta `{reenroll:true}`).
+- Admin reset: Telegram `/reset <host>` sets `token_hash` NULL (audit action `device.reset`). The agent then gets 401 `device not enrolled`, clears `device_id` and `device_token`, and re-enrolls on its next cycle.
+- Agent config key `device_token` (written by the Agent after enroll into agent.config.json — folder ACL-locked; never server-pushable). Secrets masked in logs: shared_secret AND device_token.
+- Common functions (exact names): `New-ScgDeviceToken` → string · `Get-ScgTokenHash -Token` → hex string · `Test-ScgDeviceToken -Token -Hash` → bool (constant-time, false on null/empty).
+- Database functions (exact names): `Set-ScgDeviceToken -Path -DeviceId -TokenHash` · `Clear-ScgDeviceToken -Path -DeviceId` → bool · device rows expose `token_hash`.
+- HttpServer: handlers receive `$Request.Headers` (case-insensitive hashtable, at least `X-SCG-Device-Token`) in addition to Method/Path/Body/RemoteIp. The shared-secret/replay pipeline order is unchanged; device-token checks happen inside the Hub handlers.
+- New audit action: `device.reset`.
+
 ## Command payload (v1.2, FROZEN)
 `commands.payload_json` is a JSON object. Only key defined: `sc_id` (16-hex, lowercase) — the ScreenConnect instance targeted by `remove` (mandatory), `harden` and `restore` (optional: absent = all allow-listed agents on the device). `status`/`agents`/`ping`: `{}`. Producers (Telegram) and consumers (Agent) MUST use `sc_id`; the key `id` is NOT part of the contract.
 Agent result for `remove`: a result string starting `refused:` or `aborted:` means `ok=false` (nothing was removed).

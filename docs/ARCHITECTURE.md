@@ -78,6 +78,32 @@ Entry point: `src/SCGuardian.ps1` (see README for modes). It loads modules from 
 
 All flows are agent-initiated. The hub never opens a connection to an agent.
 
+### 3.0 Token flow (per-device tokens, contract v2.0)
+
+```
+Agent                                              Hub
+  | POST /enroll {hostname, ...}  (Bearer = shared secret)
+  |------------------------------------------------>|  new hostname, or hostname with token_hash NULL (after /reset):
+  |                                                 |    New-ScgDeviceToken (32 random bytes, base64url)
+  |                                                 |    store Get-ScgTokenHash (SHA-256 hex) in devices.token_hash
+  |<------------------------------------------------|  {ok, device_id, device_token}   (token shown once)
+  | save device_id + device_token in agent.config.json (ACL-locked)
+  |                                                 |
+  | POST /heartbeat | /result | /event              |
+  |   Bearer + X-SCG-Device-Token                   |
+  |------------------------------------------------>|  bearer, replay checks, then in the handler:
+  |                                                 |    unknown device_id -> 404
+  |                                                 |    token_hash NULL -> 401 device not enrolled
+  |                                                 |    Test-ScgDeviceToken (constant-time) fails -> 401 invalid device token
+  |                                                 |
+Telegram admin --/reset host--> Clear-ScgDeviceToken (token_hash = NULL, audit device.reset)
+  | next call gets 401 device not enrolled -> agent clears device_id + device_token -> re-enrolls
+```
+
+An `/enroll` for a hostname that already holds a token is always 409 `hostname already enrolled` (audit `enroll_conflict`). The agent
+sends the token header only on `/heartbeat`, `/result` and `/event`, and never logs it (`Protect-Secret` masks it). The hub never stores
+the raw token.
+
 ### 3.1 Heartbeat (the carrier of everything else)
 
 ```
@@ -85,7 +111,7 @@ Agent                                              Hub
   | POST /heartbeat {device_id, hostname,           |
   |   sc_agents[], discovery_ok, uptime_sec, ...}   |
   |------------------------------------------------>|  auth pipeline (see API.md)
-  |                                                 |  device lookup (404 if unknown)
+  |                                                 |  device lookup (404 if unknown), device token check (401)
   |                                                 |  update last_seen / ip / agent_version
   |                                                 |  Sync-ScgScAgent (upsert + delete-missing)
   |                                                 |  Get-ScgDispatchableCommand:
@@ -148,7 +174,7 @@ device with `local_watchdog` in `agent.config.json`.
 ### 4.3 Server-pushed config is a whitelist
 
 The heartbeat response carries `scan_interval_sec`, `heartbeat_sec`, `allowed_ids`, `alert_throttle_min`. The agent
-adopts only those keys, range-checked, and never `shared_secret`, `hub_url` or `trusted_server_thumbprint`. An empty
+adopts only those keys, range-checked, and never `shared_secret`, `hub_url`, `trusted_server_thumbprint`, `device_id` or `device_token`. An empty
 or invalid pushed `allowed_ids` is rejected and the local list kept. For `remove`, the effective allow-list is the
 union of the current and the pre-update list, so a same-heartbeat shrink cannot authorise removing an allow-listed
 agent.
@@ -167,7 +193,7 @@ SQLite, file path from `database.path` (default `C:\ProgramData\SCGuardian\hub.d
 | Table | Purpose | Key columns |
 |---|---|---|
 | `schema_version` | applied migrations | `version`, `applied_at` |
-| `devices` | one row per host | `id` (GUID), `hostname` (UNIQUE), `os`, `os_version`, `last_ip`, `first_seen`, `last_seen`, `status` (`active`/`stale`/`quarantined`), `agent_version`, `tags`, `config_json` |
+| `devices` | one row per host | `id` (GUID), `hostname` (UNIQUE), `os`, `os_version`, `last_ip`, `first_seen`, `last_seen`, `status` (`active`/`stale`/`quarantined`), `agent_version`, `tags`, `config_json`, `token_hash` (SHA-256 hex of the device token, NULL = not enrolled; migration 3) |
 | `sc_agents` | ScreenConnect instances seen per device | PK `(device_id, id)`, `service_name`, `folder`, `uninstall_key`, `authorized` (0/1), `state`, `first_seen`, `last_seen` |
 | `commands` | command queue and history | `id`, `device_id`, `type`, `payload_json`, `status`, `created_at`, `dispatched_at`, `finished_at`, `result_json`, `issued_by`, `issued_via` |
 | `events` | agent-reported events | `id`, `device_id`, `type`, `severity`, `payload_json`, `created_at`, `acked_at`, `acked_by` |
@@ -181,7 +207,7 @@ same id appears on every machine joined to it (contract amendment v1.1, migratio
 
 Command state machine: `pending -> dispatched -> done | failed | timeout`, and `pending -> timeout`. Nothing else.
 
-Idempotency rules enforced in `Database.psm1`: devices upsert by hostname (re-enroll returns the same id);
+Idempotency rules enforced in `Database.psm1`: devices upsert by hostname (re-enroll, allowed only while `token_hash` is NULL, returns the same id);
 `sc_agents` rows absent from a heartbeat are deleted in the same transaction, except when the list is empty and
 `-AllowEmpty` was not passed; duplicate pending/dispatched commands return the existing id; events dedupe inside the
 throttle window.
@@ -192,7 +218,7 @@ There is no retention job in v1: `events`, `commands` and `audit_log` grow witho
 
 `Start-ScgHub` loads and validates the config, locks the data and log directories (SYSTEM + Administrators),
 initialises the database, sets the masking log context (`shared_secret` and `bot_token` are masked in every log
-line), and starts three independent units:
+line; the agent additionally masks `device_token`), and starts three independent units:
 
 | Unit | Where | What it does |
 |---|---|---|

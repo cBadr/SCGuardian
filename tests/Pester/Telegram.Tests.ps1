@@ -277,6 +277,74 @@ Describe 'Telegram module' {
         }
     }
 
+    Context '/reset device token' {
+        BeforeEach {
+            Mock Clear-ScgDeviceToken -ModuleName Telegram { $true }
+        }
+        It 'admin /reset host revokes the token and warns about the fleet secret' {
+            Send-Test (New-TestMessage '/reset pc1')
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 1 -Exactly
+            $script:Sent[0].Text | Should -Match 'revoked'
+            $script:Sent[0].Text | Should -Match 're-enroll'
+            $script:Sent[0].Text | Should -Match 'fleet secret'
+            $script:Sent[0].Text | Should -Match '/events'
+        }
+        It 'non-admin /reset is blocked and clears nothing' {
+            Send-Test (New-TestMessage '/reset PC1' -FromId '999' -User 'nobody')
+            $script:Sent.Count | Should -Be 0
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 0 -Exactly
+        }
+        It 'reset all is refused' {
+            Send-Test (New-TestMessage '/reset all')
+            $script:Sent[0].Text | Should -Match 'refused'
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 0 -Exactly
+            Should -Invoke Add-ScgAudit -ModuleName Telegram -Times 0 -Exactly -ParameterFilter { $Action -eq 'device.reset' }
+        }
+        It 'unknown host gives an error and no reset audit' {
+            Send-Test (New-TestMessage '/reset nope')
+            $script:Sent[0].Text | Should -Match 'Unknown host'
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 0 -Exactly
+            Should -Invoke Add-ScgAudit -ModuleName Telegram -Times 0 -Exactly -ParameterFilter { $Action -eq 'device.reset' }
+        }
+        It 'writes the device.reset audit row with actor, device id and hostname' {
+            Send-Test (New-TestMessage '/reset PC2')
+            Should -Invoke Add-ScgAudit -ModuleName Telegram -Times 1 -Exactly -ParameterFilter {
+                $Action -eq 'device.reset' -and $Actor -eq 'telegram:42' -and $Target -eq '22222222-2222-2222-2222-222222222222' -and $Meta.hostname -eq 'PC2'
+            }
+        }
+        It 'calls Clear-ScgDeviceToken once with the right device id' {
+            Send-Test (New-TestMessage '/reset PC3')
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 1 -Exactly -ParameterFilter { $DeviceId -eq '33333333-3333-3333-3333-333333333333' -and $Path -eq 'test.db' }
+        }
+        It 'a failed clear writes no audit row' {
+            Mock Clear-ScgDeviceToken -ModuleName Telegram { $false }
+            Send-Test (New-TestMessage '/reset PC1')
+            Should -Invoke Add-ScgAudit -ModuleName Telegram -Times 0 -Exactly -ParameterFilter { $Action -eq 'device.reset' }
+        }
+        It 'button flow: a:reset shows confirm and acts only on rst' {
+            Send-Test (New-TestCallback 'a:reset:11111111')
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 0 -Exactly
+            $btn = Get-TestButton $script:Sent[0].Markup
+            $btn.Count | Should -Be 2
+            $btn[0].callback_data | Should -Be 'rst:11111111'
+            $btn[1].callback_data | Should -Be 'd:11111111'
+            Send-Test (New-TestCallback 'rst:11111111')
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 1 -Exactly -ParameterFilter { $DeviceId -eq '11111111-1111-1111-1111-111111111111' }
+            Should -Invoke Add-ScgAudit -ModuleName Telegram -Times 1 -Exactly -ParameterFilter { $Action -eq 'device.reset' }
+        }
+        It 'device menu carries the Reset token button and callbacks stay within 64 bytes' {
+            $d = [pscustomobject]@{ id = '11111111-1111-1111-1111-111111111111'; hostname = 'PC1'; status = 'active' }
+            (Get-TestButton (New-TgMenu -Name 'device' -Context @{ Device = $d; HasUnknown = $false })).callback_data | Should -Contain 'a:reset:11111111'
+            foreach ($b in (Get-TestButton (New-TgMenu -Name 'reset-confirm' -Context @{ DeviceId8 = 'ffffffff' }))) {
+                [Text.Encoding]::UTF8.GetByteCount($b.callback_data) | Should -BeLessOrEqual 64
+            }
+        }
+        It 'non-admin reset callback is rejected' {
+            Send-Test (New-TestCallback 'rst:11111111' -FromId '999' -User 'nobody')
+            Should -Invoke Clear-ScgDeviceToken -ModuleName Telegram -Times 0 -Exactly
+        }
+    }
+
     Context 'menus' {
         It 'main menu has the five buttons with grammar-valid data' {
             $btn = Get-TestButton (New-TgMenu -Name 'main')

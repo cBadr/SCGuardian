@@ -72,6 +72,11 @@ Describe 'Chaos: hub outage and recovery' {
         (Get-ChaosWatchdogCount) | Should -BeGreaterOrEqual 1
     }
 
+    It 'stores a device token at enroll and keeps it across the outage' {
+        $script:Token = Get-ScgTestAgentToken -ConfigPath $script:AgentCfg
+        $script:Token.Length | Should -BeGreaterOrEqual 20
+    }
+
     It 'keeps running the local watchdog and counts failures while the hub is down' {
         Stop-ScgTestHub -Hub $script:Hub
         $script:Hub = $null
@@ -122,5 +127,10 @@ Describe 'Chaos: hub outage and recovery' {
         $s2 = Invoke-ChaosCycle -Now $script:LastNow.AddMinutes(2)
         $s2.HubOk | Should -BeTrue
         Get-ChaosLogCount -Pattern 'Hub reachable again' | Should -Be 1
+    }
+
+    It 'still uses the same device token after recovery and never logs it' {
+        (Get-ScgTestAgentToken -ConfigPath $script:AgentCfg) | Should -Be $script:Token
+        Get-ChaosLogCount -Pattern $script:Token | Should -Be 0
     }
 }

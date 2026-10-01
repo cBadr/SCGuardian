@@ -41,6 +41,9 @@ $script:Migrations = @{
         'ALTER TABLE sc_agents_new RENAME TO sc_agents',
         'CREATE INDEX IF NOT EXISTS idx_sc_agents_device ON sc_agents(device_id)'
     )
+    3 = @(
+        'ALTER TABLE devices ADD COLUMN token_hash TEXT'
+    )
 }
 
 function Import-ScgSqliteAssembly {
@@ -300,6 +303,11 @@ function Invoke-ScgMigration {
             Start-ScgTx -Connection $conn
             try {
                 foreach ($stmt in $script:Migrations[$ver]) {
+                    if ($stmt -match '^ALTER TABLE (\w+) ADD COLUMN (\w+)') {
+                        $tbl = $Matches[1]; $col = $Matches[2]
+                        $cols = @(Invoke-ScgSqlCore -Connection $conn -Sql ('PRAGMA table_info(' + $tbl + ')'))
+                        if (@($cols | Where-Object { [string]$_.name -eq $col }).Count -gt 0) { continue }
+                    }
                     [void](Invoke-ScgSqlCore -Connection $conn -Sql $stmt -NonQuery)
                 }
                 [void](Invoke-ScgSqlCore -Connection $conn -NonQuery -Sql 'INSERT INTO schema_version (version, applied_at) VALUES (@v, @t)' -Parameter @{ v = [int]$ver; t = (Get-ScgUtcNow) })
@@ -496,6 +504,54 @@ function Set-ScgDeviceStatus {
         [Parameter(Mandatory = $true)][ValidateSet('active', 'stale', 'quarantined')][string]$Status
     )
     $n = Invoke-ScgSql -Path $Path -NonQuery -Sql 'UPDATE devices SET status=@s WHERE id=@id' -Parameter @{ s = $Status; id = $DeviceId }
+    return ($n -gt 0)
+}
+
+function Set-ScgDeviceToken {
+    <#
+    .SYNOPSIS
+        Stores the device token hash (lowercase hex SHA-256; never the raw token). Returns false for unknown device.
+    .PARAMETER Path
+        Database file path.
+    .PARAMETER DeviceId
+        Device id.
+    .PARAMETER TokenHash
+        Hex SHA-256 of the raw token (stored lowercase).
+    .PARAMETER IfUnset
+        Optional: write only when token_hash is currently NULL (atomic guard against concurrent enrolls);
+        returns false when a hash is already set.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$DeviceId,
+        [Parameter(Mandatory = $true)][string]$TokenHash,
+        [Parameter()][switch]$IfUnset
+    )
+    if ($TokenHash -notmatch '^[0-9a-fA-F]{64}$') { throw 'Invalid token hash (expected 64 hex characters).' }
+    $sql = 'UPDATE devices SET token_hash=@th WHERE id=@id'
+    if ($IfUnset) { $sql += ' AND token_hash IS NULL' }
+    $n = Invoke-ScgSql -Path $Path -NonQuery -Sql $sql -Parameter @{ th = $TokenHash.ToLowerInvariant(); id = $DeviceId }
+    return ($n -gt 0)
+}
+
+function Clear-ScgDeviceToken {
+    <#
+    .SYNOPSIS
+        Sets token_hash to NULL (admin reset). Returns false for unknown device.
+    .PARAMETER Path
+        Database file path.
+    .PARAMETER DeviceId
+        Device id.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$DeviceId
+    )
+    $n = Invoke-ScgSql -Path $Path -NonQuery -Sql 'UPDATE devices SET token_hash=NULL WHERE id=@id' -Parameter @{ id = $DeviceId }
     return ($n -gt 0)
 }
 
@@ -988,7 +1044,7 @@ function Add-ScgAudit {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$Actor,
-        [Parameter(Mandatory = $true)][ValidateSet('command.issue', 'command.dispatch', 'command.result', 'command.timeout', 'enroll', 'heartbeat.config_change', 'event.ingest', 'event.ack', 'remove.request', 'remove.confirm', 'auth.reject')][string]$Action,
+        [Parameter(Mandatory = $true)][ValidateSet('command.issue', 'command.dispatch', 'command.result', 'command.timeout', 'enroll', 'heartbeat.config_change', 'event.ingest', 'event.ack', 'remove.request', 'remove.confirm', 'auth.reject', 'device.reset')][string]$Action,
         [Parameter()][AllowNull()][AllowEmptyString()][string]$Target,
         [Parameter()][AllowNull()][object]$Meta
     )
@@ -1056,4 +1112,4 @@ function Get-ScgHealthCounts {
     return [pscustomobject]@{ devices_online = [int]$d[0].n; commands_pending = [int]$c[0].n }
 }
 
-Export-ModuleMember -Function Initialize-ScgDatabase, Get-ScgSchemaVersion, Invoke-ScgMigration, Invoke-ScgSql, Register-ScgDevice, Update-ScgDeviceSeen, Test-ScgDeviceOnline, Set-ScgDeviceStatus, Sync-ScgScAgent, Get-ScgDevice, Get-ScgScAgent, New-ScgCommand, Get-ScgDispatchableCommand, Get-ScgCommand, Complete-ScgCommand, Invoke-ScgCommandTimeout, Set-ScgStaleDevice, Add-ScgEvent, Get-ScgEvent, Confirm-ScgEvent, Add-ScgAudit, Get-ScgAudit, Get-ScgLastAudit, Get-ScgHealthCounts
+Export-ModuleMember -Function Initialize-ScgDatabase, Get-ScgSchemaVersion, Invoke-ScgMigration, Invoke-ScgSql, Register-ScgDevice, Update-ScgDeviceSeen, Test-ScgDeviceOnline, Set-ScgDeviceStatus, Set-ScgDeviceToken, Clear-ScgDeviceToken,Sync-ScgScAgent, Get-ScgDevice, Get-ScgScAgent, New-ScgCommand, Get-ScgDispatchableCommand, Get-ScgCommand, Complete-ScgCommand, Invoke-ScgCommandTimeout, Set-ScgStaleDevice, Add-ScgEvent, Get-ScgEvent, Confirm-ScgEvent, Add-ScgAudit, Get-ScgAudit, Get-ScgLastAudit, Get-ScgHealthCounts

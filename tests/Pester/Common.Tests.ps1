@@ -200,6 +200,67 @@ Describe 'ConvertTo-ScgNativeArgument' {
     }
 }
 
+Describe 'Add-ScgLogSecret' {
+    It 'adds a secret on top of the existing list without touching the path' {
+        $log = Join-Path $TestDrive 'logs\add.log'
+        Set-ScgLogContext -Path $log -MaxBytes 100000 -Secret @('firstsecret')
+        Add-ScgLogSecret -Secret @('devtok-AbC_123', '', $null)
+        Add-ScgLogSecret -Secret @('devtok-AbC_123')
+        Write-ScgLog -Message 'a firstsecret b devtok-AbC_123 c' -Level INFO
+        $txt = Get-Content -LiteralPath $log -Raw
+        $txt | Should -Not -Match 'firstsecret'
+        $txt | Should -Not -Match 'devtok-AbC_123'
+        $txt | Should -Match 'a \*\*\* b \*\*\* c'
+    }
+}
+
+Describe 'Per-device tokens' {
+    It 'New-ScgDeviceToken returns 43 base64url characters without padding' {
+        foreach ($i in 1..20) {
+            $t = New-ScgDeviceToken
+            $t.Length | Should -Be 43
+            $t | Should -Match '^[A-Za-z0-9_-]{43}$'
+        }
+    }
+    It 'New-ScgDeviceToken is unique across many calls' {
+        $seen = @{}
+        foreach ($i in 1..200) { $seen[(New-ScgDeviceToken)] = $true }
+        $seen.Count | Should -Be 200
+    }
+    It 'Get-ScgTokenHash matches the known SHA-256 vectors in lowercase hex' {
+        Get-ScgTokenHash -Token 'abc' | Should -BeExactly 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad'
+        Get-ScgTokenHash -Token '' | Should -BeExactly 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855'
+    }
+    It 'Get-ScgTokenHash hashes the UTF-8 bytes' {
+        $expected = -join ([System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes([string][char]0x00E9)) | ForEach-Object { $_.ToString('x2') })
+        Get-ScgTokenHash -Token ([string][char]0x00E9) | Should -BeExactly $expected
+    }
+    It 'Test-ScgDeviceToken accepts the right token in any hash case' {
+        $t = New-ScgDeviceToken
+        $h = Get-ScgTokenHash -Token $t
+        Test-ScgDeviceToken -Token $t -Hash $h | Should -BeTrue
+        Test-ScgDeviceToken -Token $t -Hash $h.ToUpperInvariant() | Should -BeTrue
+    }
+    It 'Test-ScgDeviceToken rejects a wrong token' {
+        $h = Get-ScgTokenHash -Token (New-ScgDeviceToken)
+        Test-ScgDeviceToken -Token (New-ScgDeviceToken) -Hash $h | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abd' -Hash 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' | Should -BeFalse
+    }
+    It 'Test-ScgDeviceToken returns false on null, empty or malformed input without throwing' {
+        $h = Get-ScgTokenHash -Token 'abc'
+        { Test-ScgDeviceToken -Token $null -Hash $null } | Should -Not -Throw
+        Test-ScgDeviceToken -Token $null -Hash $h | Should -BeFalse
+        Test-ScgDeviceToken -Token '' -Hash $h | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abc' -Hash $null | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abc' -Hash '' | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abc' -Hash $h.Substring(0, 63) | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abc' -Hash ($h + '0') | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abc' -Hash ('z' + $h.Substring(1)) | Should -BeFalse
+        Test-ScgDeviceToken -Token 'abc' -Hash 'abc' | Should -BeFalse
+        Test-ScgDeviceToken | Should -BeFalse
+    }
+}
+
 Describe 'New-ScgGuid' {
     It 'returns a parsable guid' {
         $g = New-ScgGuid

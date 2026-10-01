@@ -343,7 +343,8 @@ function Invoke-ScgTestRequest {
         [string]$Nonce = ([guid]::NewGuid().ToString()),
         [string]$Timestamp = ([datetime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture)),
         $Body = $null,
-        [string]$Thumbprint = ''
+        [string]$Thumbprint = '',
+        [hashtable]$Headers = @{}
     )
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor [System.Net.SecurityProtocolType]::Tls12
     $req = [System.Net.HttpWebRequest]::Create($Url)
@@ -358,6 +359,7 @@ function Invoke-ScgTestRequest {
     $req.Headers.Add('Authorization', 'Bearer ' + $Bearer)
     $req.Headers.Add('X-SCG-Timestamp', $Timestamp)
     $req.Headers.Add('X-SCG-Nonce', $Nonce)
+    foreach ($hk in @($Headers.Keys)) { $req.Headers.Add([string]$hk, [string]$Headers[$hk]) }
     if ($Method -eq 'POST') {
         $json = '{}'
         if ($null -ne $Body) { $json = ConvertTo-Json -InputObject $Body -Depth 8 -Compress }
@@ -381,6 +383,46 @@ function Invoke-ScgTestRequest {
     finally { $resp.Dispose() }
 }
 
+function Get-ScgTestAgentToken {
+    <# .SYNOPSIS Reads device_token from an agent.config.json ('' when absent). #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$ConfigPath)
+    try {
+        $c = Get-Content -LiteralPath $ConfigPath -Raw | ConvertFrom-Json
+        $p = $c.PSObject.Properties['device_token']
+        if ($p -and $p.Value) { return [string]$p.Value }
+    }
+    catch { $null = $_ }
+    return ''
+}
+
+function Test-ScgTestTextContains {
+    <# .SYNOPSIS True when any file under the given roots (recursive, text-ish) contains Needle. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Root, [Parameter(Mandatory)][string]$Needle, [string[]]$Include = @('*.log', '*.txt', '*.jsonl', '*.log.*'))
+    foreach ($r in $Root) {
+        if (-not (Test-Path -LiteralPath $r)) { continue }
+        # -Include is ignored with -LiteralPath on Windows PowerShell 5.1, so filter by name explicitly
+        $candidates = @(Get-ChildItem -LiteralPath $r -Recurse -File -ErrorAction SilentlyContinue | Where-Object {
+                $n = $_.Name
+                @($Include | Where-Object { $n -like $_ }).Count -gt 0
+            })
+        foreach ($f in $candidates) {
+            try {
+                $fs = New-Object System.IO.FileStream($f.FullName, 'Open', 'Read', 'ReadWrite')
+                try {
+                    $sr = New-Object System.IO.StreamReader($fs)
+                    $t = $sr.ReadToEnd()
+                }
+                finally { $fs.Dispose() }
+                if ($t.Contains($Needle)) { return $true }
+            }
+            catch { $null = $_ }
+        }
+    }
+    return $false
+}
+
 function New-ScgTestTgUpdate {
     <# .SYNOPSIS Synthetic Telegram message update. #>
     [CmdletBinding()]
@@ -401,4 +443,4 @@ Export-ModuleMember -Function Get-ScgTestModuleDir, Get-ScgTestKnownId, Import-S
     Test-ScgTestPortFree, Get-ScgTestFreePort, New-ScgTestSecret, New-ScgTestRoot, Remove-ScgTestPath, Write-ScgTestJson,
     New-ScgTestHubConfig, New-ScgTestAgentConfig, Enable-ScgTestNetworkGuard, Disable-ScgTestNetworkGuard,
     Set-ScgTestModuleAlias, Install-ScgTestStub, Install-ScgAgentShim, Invoke-ScgTestAgentCycle, Read-ScgTestShimLog,
-    Start-ScgTestHub, Stop-ScgTestHub, Initialize-ScgTestTrust, Invoke-ScgTestRequest, New-ScgTestTgUpdate
+    Start-ScgTestHub, Stop-ScgTestHub, Initialize-ScgTestTrust, Invoke-ScgTestRequest, New-ScgTestTgUpdate, Get-ScgTestAgentToken, Test-ScgTestTextContains

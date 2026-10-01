@@ -157,6 +157,52 @@ Describe 'Invoke-ScgRequestPipeline' {
         $r.Body.got | Should -Be 'd1'
         $script:Probe.Called | Should -Be 1
     }
+    It 'passes request headers to the handler as a case-insensitive table without Authorization' {
+        $probe = $script:Probe
+        $routes = @{ 'POST /heartbeat' = { param($Request) $probe.Req = $Request; @{ Status = 200; Body = @{ ok = $true } } }.GetNewClosure() }
+        $h = New-TestHeader
+        $h['x-scg-device-token'] = 'tok-123'
+        $r = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers $h -Body '{"device_id":"d1"}' -RemoteIp '10.0.0.7' -Secret $script:Secret -Route $routes -ReplayCache $script:Cache -Now $script:Now
+        $r.Status | Should -Be 200
+        $req = $script:Probe.Req
+        $req.Method | Should -Be 'POST'
+        $req.Path | Should -Not -BeNullOrEmpty
+        $req.RemoteIp | Should -Be '10.0.0.7'
+        $req.Body.device_id | Should -Be 'd1'
+        $req.Headers | Should -BeOfType [hashtable]
+        $req.Headers['X-SCG-Device-Token'] | Should -Be 'tok-123'
+        $req.Headers['X-SCG-DEVICE-TOKEN'] | Should -Be 'tok-123'
+        $req.Headers.ContainsKey('Authorization') | Should -BeFalse
+    }
+    It 'reads headers from a NameValueCollection' {
+        $probe = $script:Probe
+        $routes = @{ 'POST /heartbeat' = { param($Request) $probe.Req = $Request; @{ Status = 200; Body = @{ ok = $true } } }.GetNewClosure() }
+        $nvc = New-Object System.Collections.Specialized.NameValueCollection
+        foreach ($kv in (New-TestHeader).GetEnumerator()) { $nvc.Add([string]$kv.Key, [string]$kv.Value) }
+        $nvc.Add('X-SCG-Device-Token', 'tok-nvc')
+        $r = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers $nvc -Body '{"device_id":"d1"}' -Secret $script:Secret -Route $routes -ReplayCache $script:Cache -Now $script:Now
+        $r.Status | Should -Be 200
+        $script:Probe.Req.Headers['x-scg-device-token'] | Should -Be 'tok-nvc'
+    }
+    It 'keeps the bearer, timestamp, nonce order even when a device token header is present' {
+        $h = New-TestHeader -Bearer 'wrong'
+        $h['X-SCG-Device-Token'] = 'tok'
+        $r1 = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers $h -Body '{"device_id":"d1"}' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache -OnReject $script:OnReject -Now $script:Now
+        $r1.Status | Should -Be 401
+        $h2 = New-TestHeader -At $script:Now.AddSeconds(-301)
+        $h2['X-SCG-Device-Token'] = 'tok'
+        $r2 = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers $h2 -Body '{"device_id":"d1"}' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache -OnReject $script:OnReject -Now $script:Now
+        $r2.Status | Should -Be 408
+        $h3 = New-TestHeader
+        $h3['X-SCG-Device-Token'] = 'tok'
+        [void](Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers $h3 -Body '{"device_id":"d1"}' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache -Now $script:Now)
+        $r3 = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers $h3 -Body '{"device_id":"d1"}' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache -OnReject $script:OnReject -Now $script:Now
+        $r3.Status | Should -Be 409
+        $script:Probe.Called | Should -Be 1
+        $script:Probe.Rejects | Should -Contain 'bad_bearer'
+        $script:Probe.Rejects | Should -Contain 'stale_timestamp'
+        $script:Probe.Rejects | Should -Contain 'replayed_nonce'
+    }
     It 'never reaches the handler on a bad bearer' {
         $r = Invoke-ScgRequestPipeline -Method POST -Path '/api/v1/heartbeat' -Headers (New-TestHeader -Bearer 'wrong') -Body '{"device_id":"d1"}' -RemoteIp '10.0.0.1' -Secret $script:Secret -Route $script:Routes -ReplayCache $script:Cache -OnReject $script:OnReject -Now $script:Now
         $r.Status | Should -Be 401

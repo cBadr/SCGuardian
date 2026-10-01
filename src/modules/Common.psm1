@@ -141,6 +141,106 @@ function Set-ScgLogContext {
     $script:LogSecret = @($Secret | Where-Object { -not [string]::IsNullOrEmpty($_) })
 }
 
+function Add-ScgLogSecret {
+    <#
+    .SYNOPSIS
+        Appends secrets to the module-scoped mask list (keeps path, size and existing secrets); ignores empty and duplicate values.
+    .PARAMETER Secret
+        Secrets masked in every later log line.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Secret
+    )
+    $list = New-Object System.Collections.Generic.List[string]
+    foreach ($s in @($script:LogSecret)) { if (-not [string]::IsNullOrEmpty($s)) { $list.Add($s) } }
+    foreach ($s in @($Secret)) {
+        if ([string]::IsNullOrEmpty($s)) { continue }
+        if (-not $list.Contains($s)) { $list.Add($s) }
+    }
+    $script:LogSecret = $list.ToArray()
+}
+
+function New-ScgDeviceToken {
+    <#
+    .SYNOPSIS
+        Returns a new per-device token: 32 random bytes (RNGCryptoServiceProvider) as base64url without padding (43 chars).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+    $bytes = New-Object byte[] 32
+    $rng = New-Object System.Security.Cryptography.RNGCryptoServiceProvider
+    try { $rng.GetBytes($bytes) } finally { $rng.Dispose() }
+    $b64 = [System.Convert]::ToBase64String($bytes)
+    return $b64.TrimEnd('=').Replace('+', '-').Replace('/', '_')
+}
+
+function Get-ScgTokenHash {
+    <#
+    .SYNOPSIS
+        Lowercase hex SHA-256 of the UTF-8 bytes of Token.
+    .PARAMETER Token
+        Raw token text.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string]$Token
+    )
+    $data = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Token)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try { $digest = $sha.ComputeHash($data) } finally { $sha.Dispose() }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($b in $digest) { [void]$sb.Append($b.ToString('x2')) }
+    return $sb.ToString()
+}
+
+function Test-ScgDeviceToken {
+    <#
+    .SYNOPSIS
+        Constant-time check that SHA-256(Token) equals Hash (hex, case-insensitive); false on null, empty or malformed input, never throws.
+    .PARAMETER Token
+        Raw token presented by the caller.
+    .PARAMETER Hash
+        Stored lowercase hex SHA-256.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Token,
+
+        [Parameter()]
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string]$Hash
+    )
+    try {
+        if ([string]::IsNullOrEmpty($Token) -or [string]::IsNullOrEmpty($Hash)) { return $false }
+        if ($Hash.Length -ne 64) { return $false }
+        if ($Hash -notmatch '^[0-9a-fA-F]{64}\z') { return $false }
+        $calc = Get-ScgTokenHash -Token $Token
+        $want = $Hash.ToLowerInvariant()
+        $diff = 0
+        for ($i = 0; $i -lt 64; $i++) {
+            $diff = $diff -bor (([int][char]$calc[$i]) -bxor ([int][char]$want[$i]))
+        }
+        return ($diff -eq 0)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Write-ScgLog {
     <#
     .SYNOPSIS
@@ -575,4 +675,4 @@ function Test-ScgThrottle {
     return ($age -lt $ThrottleMin)
 }
 
-Export-ModuleMember -Function Get-ScgRoot, Get-ScgUtcNow, ConvertTo-ScgUtcIso, ConvertFrom-ScgUtcIso, Protect-Secret, Set-ScgLogContext, Write-ScgLog, Read-ScgJsonFile, Save-ScgJsonFile, Test-ScgInstanceId, ConvertTo-ScgInstanceId, New-ScgGuid, Invoke-ScgNative, Initialize-ScgSecureDirectory, Get-ScgBackoffSec, Test-ScgThrottle
+Export-ModuleMember -Function Get-ScgRoot, Get-ScgUtcNow, ConvertTo-ScgUtcIso, ConvertFrom-ScgUtcIso, Protect-Secret, Set-ScgLogContext, Add-ScgLogSecret, Write-ScgLog, Read-ScgJsonFile, Save-ScgJsonFile, Test-ScgInstanceId, ConvertTo-ScgInstanceId, New-ScgGuid, Invoke-ScgNative, Initialize-ScgSecureDirectory, Get-ScgBackoffSec, Test-ScgThrottle, New-ScgDeviceToken, Get-ScgTokenHash, Test-ScgDeviceToken

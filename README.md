@@ -19,6 +19,8 @@ and a small **agent** per endpoint:
 - Agents connect **out** to the hub over HTTPS (pull model): no inbound ports on endpoints, works behind NAT.
 - A local watchdog on each endpoint keeps protecting even when the hub is down.
 - Every request is authenticated (bearer), replay-protected (timestamp and nonce) and audited.
+- **Per-device tokens:** each endpoint gets its own token at enrollment (only a SHA-256 hash is stored on the hub). A stolen shared secret can no longer impersonate an
+  existing device; an admin revokes a token with `/reset <host>`. Details: [docs/SECURITY.md](docs/SECURITY.md).
 
 The original single-file behaviour is preserved as legacy modes of the same script (see "Modes").
 
@@ -38,7 +40,8 @@ Requirements: Windows with Windows PowerShell 5.1 and an elevated prompt. The hu
 Set-Location <repo>\hub-deploy
 .\install-hub.ps1                      # -WhatIf to preview
 # edit C:\ProgramData\SCGuardian\hub.config.json  (shared_secret, telegram.*, defaults.allowed_ids)
-.\cert-setup.ps1 -Domain ostazna.pro -Port 8443       # or: .\cert-setup.ps1 -SelfSigned
+.\cert-setup.ps1 -SelfSigned                          # recommended for fleets (5-year cert, pin its thumbprint)
+# or Let's Encrypt: .\cert-setup.ps1 -Domain ostazna.pro -Port 8443   (leaf thumbprint changes at each renewal; do not pin it)
 Start-ScheduledTask -TaskName SCGuardian-Hub
 ```
 
@@ -50,7 +53,7 @@ Steps, certificate options and verification: [hub-deploy/README.md](hub-deploy/R
 msiexec /i SCGuardian.Agent.msi HUBURL=https://ostazna.pro:8443 SHAREDSECRET=*** THUMBPRINT=<hub-cert-sha1> /qn
 ```
 
-`THUMBPRINT` pins the hub certificate (recommended for production). Building the MSI and the exit codes:
+`THUMBPRINT` pins the hub certificate (recommended for production; use the 5-year self-signed certificate for fleets, because a Let's Encrypt leaf thumbprint changes at each renewal and would disconnect every agent). The agent enrolls on its first cycle and stores its own device token. Reinstalling a machine needs `/reset <host>` first. Building the MSI and the exit codes:
 [installer/README.md](installer/README.md). Rolling out through GPO or Intune: [docs/OPERATIONS.md](docs/OPERATIONS.md).
 
 ### 3. Control
@@ -83,8 +86,8 @@ Set-Location <repo>
 Invoke-Pester -CI
 ```
 
-`-CI` sets a non-zero exit code on failure. A recorded run in `tests/results.xml` shows 325 tests and 0 failures; run the suite yourself
-before relying on that number. `SCG_ROOT` is the test-only override of the data root (`C:\ProgramData\SCGuardian`).
+`-CI` sets a non-zero exit code on failure. The suite has 377 Pester tests (including the chaos tests), and a separate 26-check fleet integration run covers
+enroll, tokens and reset end to end; run both yourself before relying on those numbers. `SCG_ROOT` is the test-only override of the data root (`C:\ProgramData\SCGuardian`).
 
 ## Modes of `SCGuardian.ps1`
 
@@ -131,7 +134,7 @@ Exit codes: `0` ok or work done, `1` nothing matched, `2` error or incomplete re
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | design, data flows, modules, database, runspace model |
 | [docs/API.md](docs/API.md) | endpoints, headers, curl and PowerShell examples, status codes, semantics |
 | [docs/OPERATIONS.md](docs/OPERATIONS.md) | install at scale, secret rotation, backup, logs, Telegram commands, troubleshooting, PostgreSQL outline |
-| [docs/SECURITY.md](docs/SECURITY.md) | threat model, limits of the shared secret, pinning, replay protection, audit, known limitations |
+| [docs/SECURITY.md](docs/SECURITY.md) | threat model, shared secret and per-device tokens, pinning, replay protection, audit, known limitations |
 | [hub-deploy/README.md](hub-deploy/README.md) | hub installation and certificates |
 | [installer/README.md](installer/README.md) | building and installing the agent MSI |
 | [docs/contracts/](docs/contracts/) | frozen contracts (read-only) |

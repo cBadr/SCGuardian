@@ -20,6 +20,11 @@ $script:ValidLayer = @('Recovery', 'FolderAcl', 'ServiceSd', 'RegistryAcl')
 $script:FailureLogGapMin = 10
 $script:BackoffMaxSec = 300
 $script:HubTimeoutMs = 30000
+$script:DeviceTokenPath = @('/heartbeat', '/result', '/event')
+$script:ErrNotEnrolled = 'hub http 401: device not enrolled'
+$script:ErrBadToken = 'hub http 401: invalid device token'
+$script:ErrUnknownDevice = 'hub http 404: unknown device'
+$script:ErrEnrollConflict = 'hub http 409: hostname already enrolled'
 
 function Get-ScgProp {
     <#
@@ -188,11 +193,17 @@ function Get-ScgAgentConfig {
 
     $deviceId = Get-ScgProp $raw 'device_id' $null
     if ($null -ne $deviceId -and [string]::IsNullOrWhiteSpace([string]$deviceId)) { $deviceId = $null }
+    $deviceToken = Get-ScgProp $raw 'device_token' $null
+    if ($null -ne $deviceToken) {
+        $deviceToken = [string]$deviceToken
+        if ([string]::IsNullOrWhiteSpace($deviceToken)) { $deviceToken = $null }
+    }
 
     return [pscustomobject]@{
         hub_url                   = $hubUrl.TrimEnd('/')
         shared_secret             = $secret
         device_id                 = $deviceId
+        device_token              = $deviceToken
         hostname                  = $hostName
         heartbeat_sec             = $hb
         scan_interval_sec         = $scan
@@ -211,7 +222,7 @@ function Update-ScgAgentConfig {
         Adopts server-pushed settings into agent.config.json (whitelist only); returns whether anything changed.
     .DESCRIPTION
         Only heartbeat_sec, scan_interval_sec, allowed_ids and alert_throttle_min are read from ServerConfig.
-        shared_secret, hub_url and trusted_server_thumbprint can never be changed by this function.
+        shared_secret, hub_url, trusted_server_thumbprint, device_id and device_token can never be changed by this function.
     .PARAMETER Path
         Path to agent.config.json.
     .PARAMETER ServerConfig
@@ -304,17 +315,21 @@ function Invoke-HubApi {
         Endpoint path such as /heartbeat (appended to hub_url + /api/v1).
     .PARAMETER Body
         Optional object serialized as UTF-8 JSON.
+    .PARAMETER DeviceToken
+        Per-device token sent as X-SCG-Device-Token, only on /heartbeat, /result and /event (never on /enroll or /health).
     .OUTPUTS
-        The parsed JSON response; throws on network or non-2xx errors (message never contains the secret).
+        The parsed JSON response; throws on network or non-2xx errors (message never contains the secret or the device token).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][object]$Config,
         [Parameter(Mandatory)][ValidateSet('GET', 'POST')][string]$Method,
         [Parameter(Mandatory)][string]$Path,
-        [Parameter()][AllowNull()][object]$Body
+        [Parameter()][AllowNull()][object]$Body,
+        [Parameter()][AllowNull()][AllowEmptyString()][string]$DeviceToken
     )
     $secret = [string](Get-ScgProp $Config 'shared_secret' '')
+    $sendToken = (-not [string]::IsNullOrEmpty($DeviceToken)) -and ($script:DeviceTokenPath -ccontains $Path)
     $base = ([string](Get-ScgProp $Config 'hub_url' '')).TrimEnd('/')
     $url = $base + '/api/v1' + $Path
     $thumb = ([string](Get-ScgProp $Config 'trusted_server_thumbprint' '') -replace '[\s:]', '')
@@ -332,6 +347,7 @@ function Invoke-HubApi {
         $req.Headers.Add('Authorization', 'Bearer ' + $secret)
         $req.Headers.Add('X-SCG-Timestamp', (Get-ScgUtcNow))
         $req.Headers.Add('X-SCG-Nonce', (New-ScgGuid))
+        if ($sendToken) { $req.Headers.Add('X-SCG-Device-Token', $DeviceToken) }
 
         if ($req.RequestUri.Scheme -eq 'https') {
             if ($thumb) {
@@ -382,7 +398,7 @@ function Invoke-HubApi {
         return $parsed
     }
     catch {
-        throw (Protect-Secret -Text $_.Exception.Message -Secret @($secret))
+        throw (Protect-Secret -Text $_.Exception.Message -Secret @($secret, $DeviceToken))
     }
 }
 
@@ -725,7 +741,7 @@ function Send-ScgEvent {
     )
     if (-not $PSCmdlet.ShouldProcess($Type, 'Post event')) { return $false }
     try {
-        $null = Invoke-HubApi -Config $Config -Method POST -Path '/event' -Body @{
+        $null = Invoke-HubApi -Config $Config -Method POST -Path '/event' -DeviceToken ([string](Get-ScgProp $Config 'device_token' '')) -Body @{
             device_id = [string]$Config.device_id
             type      = $Type
             severity  = $Severity
@@ -737,6 +753,27 @@ function Send-ScgEvent {
         Write-ScgLog -Message "event $Type not delivered: $($_.Exception.Message)" -Level WARN
         return $false
     }
+}
+
+function Reset-ScgAgentIdentity {
+    <#
+    .SYNOPSIS
+        Clears device_id and device_token in agent.config.json (atomic save) so the next cycle re-enrolls; returns success.
+    .PARAMETER ConfigPath
+        Path to agent.config.json.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param([Parameter(Mandatory)][string]$ConfigPath)
+    if (-not $PSCmdlet.ShouldProcess($ConfigPath, 'Clear device identity')) { return $false }
+    try {
+        $file = Read-ScgJsonFile -Path $ConfigPath
+        Set-ScgProp -InputObject $file -Name 'device_id' -Value $null
+        Set-ScgProp -InputObject $file -Name 'device_token' -Value $null
+        Save-ScgJsonFile -Path $ConfigPath -InputObject $file
+        return $true
+    }
+    catch { return $false }
 }
 
 function Invoke-ScgAgentCycle {
@@ -770,6 +807,7 @@ function Invoke-ScgAgentCycle {
     $config = Get-ScgAgentConfig -Path $ConfigPath
     $state = Read-ScgAgentState -Path $statePath
     $secret = [string]$config.shared_secret
+    Add-ScgLogSecret -Secret @($secret, [string]$config.device_token)
 
     $summary = [pscustomobject]@{ HubAttempted = $false; HubOk = $false; Enrolled = $false; Commands = 0; Events = 0; Findings = @() }
 
@@ -788,8 +826,10 @@ function Invoke-ScgAgentCycle {
     if (-not $due) { return $summary }
 
     $summary.HubAttempted = $true
+    $phase = 'heartbeat'
     try {
         if (-not $config.device_id) {
+            $phase = 'enroll'
             $enr = Invoke-HubApi -Config $config -Method POST -Path '/enroll' -Body @{
                 hostname      = $config.hostname
                 os            = 'windows'
@@ -797,13 +837,19 @@ function Invoke-ScgAgentCycle {
                 agent_version = $script:AgentVersion
             }
             $newId = [string](Get-ScgProp $enr 'device_id' '')
+            $newToken = [string](Get-ScgProp $enr 'device_token' '')
             if ([string]::IsNullOrWhiteSpace($newId)) { throw 'enroll response has no device_id' }
+            if ([string]::IsNullOrWhiteSpace($newToken)) { throw 'enroll response has no device_token' }
+            Add-ScgLogSecret -Secret @($newToken)
             $file = Read-ScgJsonFile -Path $ConfigPath
             Set-ScgProp -InputObject $file -Name 'device_id' -Value $newId
+            Set-ScgProp -InputObject $file -Name 'device_token' -Value $newToken
             Save-ScgJsonFile -Path $ConfigPath -InputObject $file
             $config.device_id = $newId
+            $config.device_token = $newToken
             $summary.Enrolled = $true
             Write-ScgLog -Message 'Enrolled with hub' -Level INFO -Actor 'system' -Action 'enroll' -Result 'ok'
+            $phase = 'heartbeat'
         }
 
         $discoveryOk = $true
@@ -818,7 +864,7 @@ function Invoke-ScgAgentCycle {
             Write-ScgLog -Message "discovery failed: $($_.Exception.Message)" -Level ERROR -Action 'discovery'
         }
         $uptime = [int][math]::Max(0, ($nowUtc - $script:ProcessStartUtc).TotalSeconds)
-        $hb = Invoke-HubApi -Config $config -Method POST -Path '/heartbeat' -Body @{
+        $hb = Invoke-HubApi -Config $config -Method POST -Path '/heartbeat' -DeviceToken ([string]$config.device_token) -Body @{
             device_id     = [string]$config.device_id
             hostname      = $config.hostname
             sc_agents     = $hbAgents
@@ -831,6 +877,7 @@ function Invoke-ScgAgentCycle {
         if (Update-ScgAgentConfig -Path $ConfigPath -ServerConfig (Get-ScgProp $hb 'config' $null)) {
             $fresh = Get-ScgAgentConfig -Path $ConfigPath
             $fresh.device_id = $config.device_id
+            $fresh.device_token = $config.device_token
             $config = $fresh
         }
 
@@ -841,7 +888,7 @@ function Invoke-ScgAgentCycle {
             $out = [string](Get-ScgProp $res 'output' '')
             if ($out.Length -gt 16000) { $out = $out.Substring(0, 16000) }
             try {
-                $null = Invoke-HubApi -Config $config -Method POST -Path '/result' -Body @{
+                $null = Invoke-HubApi -Config $config -Method POST -Path '/result' -DeviceToken ([string]$config.device_token) -Body @{
                     device_id   = [string]$config.device_id
                     command_id  = Get-ScgProp $cmd 'id' $null
                     ok          = [bool](Get-ScgProp $res 'ok' $false)
@@ -881,16 +928,26 @@ function Invoke-ScgAgentCycle {
         $summary.HubOk = $true
     }
     catch {
-        $reason = Protect-Secret -Text $_.Exception.Message -Secret @($secret)
-        if ($reason -ceq 'hub http 404: unknown device' -and $config.device_id) {
-            try {
-                $file = Read-ScgJsonFile -Path $ConfigPath
-                Set-ScgProp -InputObject $file -Name 'device_id' -Value $null
-                Save-ScgJsonFile -Path $ConfigPath -InputObject $file
+        $reason = Protect-Secret -Text $_.Exception.Message -Secret @($secret, [string]$config.device_token)
+        if ($reason -ceq $script:ErrNotEnrolled -and $config.device_id) {
+            if (Reset-ScgAgentIdentity -ConfigPath $ConfigPath) {
+                Write-ScgLog -Message 'Hub reports this device is not enrolled (operator reset): cleared device_id and device_token, re-enrolling on the next cycle' -Level INFO -Actor 'system' -Action 'enroll' -Result 'reset'
             }
-            catch { Write-ScgLog -Message 'could not reset device_id after 404' -Level WARN }
+            else { Write-ScgLog -Message 'could not clear device_id and device_token after device not enrolled' -Level WARN }
+            Set-ScgProp -InputObject $state -Name 'next_heartbeat_utc' -Value $null
         }
-        $state = Update-ScgBackoffState -State $state -Now $nowUtc -HeartbeatSec $config.heartbeat_sec -Reason $reason
+        else {
+            if ($reason -ceq $script:ErrUnknownDevice -and $config.device_id) {
+                if (-not (Reset-ScgAgentIdentity -ConfigPath $ConfigPath)) { Write-ScgLog -Message 'could not reset device_id after 404' -Level WARN }
+            }
+            elseif ($reason -ceq $script:ErrBadToken) {
+                $reason = $reason + ' (device token rejected; an operator must /reset this device)'
+            }
+            elseif ($phase -eq 'enroll' -and $reason -ceq $script:ErrEnrollConflict) {
+                $reason = 'hostname already enrolled; ask the operator to /reset this device'
+            }
+            $state = Update-ScgBackoffState -State $state -Now $nowUtc -HeartbeatSec $config.heartbeat_sec -Reason $reason
+        }
     }
     try { Save-ScgJsonFile -Path $statePath -InputObject $state }
     catch { Write-ScgLog -Message "state not saved: $($_.Exception.Message)" -Level WARN }

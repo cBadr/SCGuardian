@@ -1,7 +1,7 @@
 # SCGuardian v4 - Security
 
-This document states what the v1 design protects, what it does not, and how to harden it further. It describes the
-code as it is. Where v1 is weak, it says so.
+This document states what the v1 design (contract v2.0, with per-device tokens) protects, what it does not, and how to harden it
+further. It describes the code as it is. Where it is weak, it says so.
 
 ## 1. Threat model
 
@@ -10,7 +10,8 @@ code as it is. Where v1 is weak, it says so.
 | Asset | Why it matters |
 |---|---|
 | Fleet control (`harden`, `restore`, `remove` commands) | `remove` deletes a service, folder and registry keys on endpoints running as SYSTEM; `restore` lowers protection |
-| Shared secret (`shared_secret`) | the only credential for the hub API |
+| Shared secret (`shared_secret`) | enrollment/bootstrap credential and transport auth for every call |
+| Per-device tokens | authenticate each device on `/heartbeat`, `/result`, `/event` |
 | Telegram bot token and ops chat | the only way to issue commands |
 | Allow-list (`allowed_ids`) | decides which ScreenConnect instances are protected and which are reported or removable |
 | `hub.db` | device inventory, command history, events, audit trail |
@@ -23,15 +24,15 @@ code as it is. Where v1 is weak, it says so.
 | Network attacker | observes or modifies traffic between endpoint and hub, or tries to impersonate the hub |
 | Internet scanner | reaches TCP 8443, has no credentials |
 | Standard user on an endpoint | cannot read `C:\ProgramData\SCGuardian` (ACL) or stop the hardened services |
-| Local administrator / SYSTEM on one endpoint | can read `agent.config.json`, including the shared secret |
-| Rogue insider with the shared secret | can call the API from anywhere that reaches the hub |
+| Local administrator / SYSTEM on one endpoint | can read `agent.config.json`, including the shared secret and that device's own token |
+| Rogue insider with the shared secret | can call the API from anywhere that reaches the hub, but cannot act as an existing device without its token |
 | Telegram account or chat compromise | sends commands as an admin, or reads fleet data |
 | Hub host compromise | SYSTEM on the hub machine |
 | Third-party remote-access installers | the unknown ScreenConnect instances SCGuardian reports (and, only on explicit admin request, removes) |
 
 ### 1.3 Trust boundaries
 
-1. Internet to hub (TCP 8443, TLS). Authenticated by shared secret; integrity and confidentiality come from TLS.
+1. Internet to hub (TCP 8443, TLS). Authenticated by shared secret plus, for `/heartbeat`, `/result` and `/event`, the device token; integrity and confidentiality come from TLS.
 2. Hub to Telegram Bot API (outbound HTTPS, bot token in the URL path as Telegram requires).
 3. Endpoint user space to SYSTEM (ACLs on the data directory; hardening of the allow-listed services).
 4. Admin chat to hub: Telegram user id (or username) membership of the configured admin lists, in the configured chat only.
@@ -39,28 +40,29 @@ code as it is. Where v1 is weak, it says so.
 
 Agents never listen on a port; only the hub is exposed.
 
-## 2. The shared secret in v1
+## 2. The shared secret and device tokens
 
-### 2.1 Why a shared secret
+### 2.1 Why a shared secret (and what it is now)
 
-One value deploys through one MSI property or one GPO/Intune command, with no certificate authority and no per-device
-enrollment workflow. That kept v1 deployable at fleet scale with a small team.
+One value deploys through one MSI property or one GPO/Intune command, with no certificate authority. Since contract v2.0 the
+shared secret is only an **enrollment/bootstrap credential plus transport auth** (it is still required on every request). Identity
+after enrollment is the per-device token (section 2.5).
 
 ### 2.2 Honest limits
 
-- **It is fleet-wide.** Every endpoint holds the same secret in `agent.config.json`. Local administrator or SYSTEM on **any one
-  endpoint** reveals it. Treat the secret as exposed to everyone who administers any machine in the fleet.
-- **What a secret holder can do:** call every endpoint of the API; enroll; send heartbeats, results and events for any
-  `device_id` they know or can obtain. The device id is a random GUID, not a secret, and a secret holder can obtain
-  the id of any **offline** host by re-enrolling its hostname (the hub returns the same id; see 2.4).
-  With a device id they can collect that device's queued commands (each is delivered once, so the genuine agent never
-  receives them), report a fabricated agent inventory (for example an explicit empty list with `discovery_ok: true`,
-  which hides unknown agents from the hub), and flood events and audit rows.
+- **The secret is still fleet-wide.** Every endpoint holds it in `agent.config.json`. Local administrator or SYSTEM on **any one
+  endpoint** reveals it (and that endpoint's own token). Treat the secret as exposed to everyone who administers any machine.
+- **What a secret holder can no longer do:** impersonate an existing device. `/heartbeat`, `/result` and `/event` need that device's
+  token, `/enroll` for a hostname that already holds a token is always 409, so the device id of an existing host cannot be
+  obtained by re-enrolling, its queued commands cannot be collected and its inventory cannot be faked.
+- **What a secret holder can still do:** call `/health` and `/enroll`; enroll **new** hostnames (creating fake devices that show in
+  the fleet); and claim a hostname **after an admin `/reset`** until the genuine agent re-enrolls (the window, section 2.4); flood
+  rejected requests into the audit log.
 - **What a secret holder cannot do:** issue commands. Commands originate only from Telegram admins. A secret alone does not give
   code execution on endpoints.
-- **Request bodies are not signed.** The bearer, timestamp and nonce authenticate the caller; body integrity relies on TLS.
+- **Request bodies are not signed.** The bearer, timestamp, nonce and token authenticate the caller; body integrity relies on TLS.
 - **No dual-secret window.** Rotation causes a short outage (see `docs/OPERATIONS.md` section 3).
-- The device id is not bound to the caller's network identity.
+- The device id and token are not bound to the caller's network identity.
 
 ### 2.3 Hub compromise equals fleet control
 
@@ -80,12 +82,28 @@ guards narrow, but do not remove, that power:
 **Never remove allow-listed agents** is enforced in three places (Telegram request, agent command handler, `Remove-ScAgent`), all using the allow-list
 the hub distributes. Keep `defaults.allowed_ids` in `hub.config.json` non-empty (the hub refuses an empty list) and under change control.
 
-### 2.4 Enroll takeover
+### 2.4 Enroll and the post-reset window
 
-`POST /enroll` keys devices by hostname. While a device is online (`last_seen` within `stale_after_min`), a second `/enroll` for that hostname is
-refused with 409 and audited as `auth.reject` (`enroll_conflict`) with the caller IP. That blocks duplicate and cloned
-identities and live takeover. It does **not** protect offline hosts: a secret holder can re-enroll a stale hostname and obtain its id. The event is audited
-as `enroll` with `reenroll: true` and the source IP. Review these rows. The durable fix is per-device credentials (section 6).
+`POST /enroll` keys devices by hostname. A hostname that already holds a token is refused **always** (online or offline) with 409
+`hostname already enrolled` and audited as `auth.reject` (`enroll_conflict`) with the caller IP. This replaces the v1 limitation
+where a secret holder could re-enroll an offline host and take over its identity (closed 2026-10-01 by v2.0).
+
+Remaining exposure: after an admin `/reset <host>` the device has no token, and the next `/enroll` for that hostname succeeds
+for **whoever calls first** with the shared secret. Normally that is the genuine agent on its next cycle. A secret holder who
+wins that race gets the token and the device id; the genuine agent then gets 409 and logs that the operator must `/reset` again.
+Mitigation: reset only when needed, check `/devices` afterwards, and review `enroll` audit rows with `reenroll: true` and the source IP.
+A stolen secret can also enroll brand-new hostnames; these appear as new devices in `/devices` and as `enroll` audit rows.
+
+### 2.5 Device token storage and rotation
+
+- The hub generates 32 random bytes (RNGCryptoServiceProvider), encoded as base64url (43 characters), and returns the token once in the `/enroll` response.
+- `hub.db` stores only `devices.token_hash`, the lowercase hex SHA-256 of the token. The raw token is never stored on the hub. The hash is unsalted SHA-256, which is
+  adequate here because the input is a 256-bit random value, not a password; it cannot be brute-forced or looked up in a table.
+- The agent keeps the raw token in `agent.config.json` (`device_token`), inside the ACL-locked data directory (SYSTEM + Administrators). The hub can never push it.
+- Verification is constant-time. Failures are audited as `auth.reject` (`bad_device_token`, `device_not_enrolled`) without the token.
+- The token is never logged: `Protect-Secret` masks both `shared_secret` and `device_token` in agent and hub logs.
+- **Rotation and revocation = `/reset <host>`** (Telegram command or the "Reset token" button with a confirm step). It sets `token_hash` to NULL (audited as
+  `device.reset`); the agent gets 401 `device not enrolled`, clears `device_id` and `device_token`, and re-enrolls with the same `device_id` and a new token.
 
 ## 3. TLS and pinning
 
@@ -97,8 +115,9 @@ as `enroll` with `reenroll: true` and the source IP. Review these rows. The dura
   purpose, so self-signed works.
 - **Recommendation: set it in every production agent** (`THUMBPRINT=` in the MSI). It turns the secret-harvesting risk above into a connection failure.
 - The thumbprint cannot be changed from the hub (not pushable). A certificate renewal that changes the leaf certificate breaks pinned agents until they are updated.
-  Let's Encrypt certificates change about every 60 to 90 days, so a pinned fleet needs either a long-lived certificate (`cert-setup.ps1 -SelfSigned` issues RSA 2048 /
-  SHA-256 valid 5 years with a non-exportable key) or a planned re-deploy. Plan the certificate lifetime before enabling the pin.
+  **For fleets, use the 5-year self-signed certificate with `trusted_server_thumbprint`** (`cert-setup.ps1 -SelfSigned` issues RSA 2048 / SHA-256 valid 5 years with a
+  non-exportable key). A Let's Encrypt leaf thumbprint changes at each renewal (about every 60 to 90 days) and would disconnect every pinned agent, so do not combine Let's Encrypt
+  with a pin unless you accept a fleet re-deploy at each renewal. Plan the certificate lifetime (and the re-pin before year 5) before enabling the pin.
 - The hub binds its certificate with `netsh http add sslcert` for port 8443.
 
 ## 4. Telegram administration
@@ -144,9 +163,9 @@ The `audit_log` table records actor, action, target and a JSON `meta`. The code 
 
 - Each security-relevant hub action writes a row with a UTC timestamp. Actors: `telegram:<id>`, `system`, `device:<hostname>`.
 - Rows recorded: `command.issue` (Telegram), `command.dispatch` (heartbeat delivered it), `command.result`, `command.timeout` (aggregate count), `enroll` (including re-enroll),
-  `heartbeat.config_change` (a device reporting a different hostname), `event.ingest` (new, non-deduplicated events), `remove.request`, `remove.confirm`, and `auth.reject`
-  (bad bearer, bad or stale timestamp, replayed nonce, cache full, unknown route, wrong method, oversized or invalid body, enroll conflict, non-admin Telegram message or button).
-- Secrets are never written to `meta` (the bearer value is not stored, only the reason code).
+  `heartbeat.config_change` (a device reporting a different hostname), `event.ingest` (new, non-deduplicated events), `remove.request`, `remove.confirm`, `device.reset` (admin token revocation), and `auth.reject`
+  (bad bearer, bad or stale timestamp, replayed nonce, cache full, unknown route, wrong method, oversized or invalid body, enroll conflict, bad device token, device not enrolled, non-admin Telegram message or button).
+- Secrets are never written to `meta` (neither the bearer value nor any device token is stored, only the reason code).
 
 **Does not guarantee:**
 
@@ -161,10 +180,11 @@ For stronger evidence, ship `hub.log` and periodic `hub.db` backups to write-onc
 
 ## 7. Secrets handling
 
-- **At rest:** `shared_secret` and `telegram.bot_token` are plain text in `hub.config.json`; `shared_secret` is plain text in each `agent.config.json`. Protection is the file ACL.
+- **At rest:** `shared_secret` and `telegram.bot_token` are plain text in `hub.config.json`; `shared_secret` and the raw `device_token` are plain text in each `agent.config.json`
+  (the hub holds only the token hash in `hub.db`). Protection is the file ACL.
   `C:\ProgramData\SCGuardian` is locked to SYSTEM and Administrators (inheritance removed, via `Initialize-ScgSecureDirectory` and the installers), `hub.config.json` gets a locked ACL in `install-hub.ps1`.
   Local administrators can read them. Keep backups under the same ACL.
-- **In logs:** every log line passes `Protect-Secret`, which replaces the configured secrets with `***` and also masks `Bearer <value>` and Telegram token patterns. The HTTP layer and the agent mask
+- **In logs:** every log line passes `Protect-Secret`, which replaces the configured secrets (shared secret and device token) with `***` and also masks `Bearer <value>` and Telegram token patterns. The HTTP layer and the agent mask
   exception text before logging or returning it. Clients get only a generic `internal error` on a 500.
 - **In the installer:** `SHAREDSECRET` is a hidden MSI property (masked in the MSI log) and `install.log` masks it. The value is visible in the process command line during install. The
   Intune app command and the GPO share both expose it to their administrators.
@@ -174,34 +194,29 @@ For stronger evidence, ship `hub.log` and periodic `hub.db` backups to write-onc
 
 ## 8. Moving to stronger authentication
 
-### 8.1 Per-device tokens (smaller change, recommended first)
+### 8.1 Per-device tokens: DONE (contract v2.0, implemented 2026-10-01)
 
-1. Amend the contracts first (field dictionary, API registry, module interfaces): new fields for the token, a new migration (for example `devices.token_hash`).
-2. Keep a shared **enrollment** secret, used only for `/enroll`, ideally short-lived.
-3. On enroll, the hub generates a random 32-byte device token, stores only its hash (SHA-256), and returns the token once in the `/enroll` response. The agent saves it in
-   `agent.config.json` (ACL protected).
-4. All other endpoints use `Authorization: Bearer <device token>` plus the device id; the hub looks up the hash and compares in constant time. One compromised endpoint then exposes only itself.
-5. Re-enrolling an existing hostname requires admin approval in Telegram (new command) instead of being automatic. This closes the offline-hostname takeover (2.4).
-6. Revocation: set the device to `quarantined` (the status already exists in the schema and Telegram icons, but no code sets it yet) and reject its token.
-7. Per-device rotation becomes possible without an outage: the hub returns a new token in a heartbeat response and the agent switches after acknowledging it.
-8. Roll out in two phases: the hub accepts both the shared secret and tokens; once every agent has a token, disable the shared secret for all but `/enroll`.
+Implemented as described in section 2.5: migration 3 adds `devices.token_hash`; the hub issues a 32-byte token once at `/enroll`; `/heartbeat`, `/result`
+and `/event` require `X-SCG-Device-Token`; an existing hostname can only be re-enrolled after an admin `/reset <host>`. The shared secret remains as the enrollment
+credential and transport auth. Not implemented (possible follow-ups): per-device rotation without an outage via a heartbeat response, a short-lived enrollment secret
+separate from the transport secret, and enforcement of the `quarantined` status.
 
-### 8.2 Mutual TLS (stronger, needs a PKI)
+### 8.2 Mutual TLS (the remaining step, needs a PKI)
 
 1. Run a private CA (for example Active Directory Certificate Services) and issue a machine certificate per endpoint through GPO auto-enrollment or Intune SCEP into `LocalMachine\My`.
 2. Hub: enable client certificate negotiation on the HTTP.sys binding (`netsh http add sslcert ... clientcertnegotiation=enable`), read the client certificate in the listener, validate the chain
    against your CA (and revocation), and map the certificate subject or thumbprint to a device row. Add this as a new step before the bearer check in `HttpServer.psm1`.
 3. Agent: `Invoke-HubApi` (the sole HTTP client) attaches the client certificate to the `HttpWebRequest`; add a config key naming the certificate.
 4. Keep `trusted_server_thumbprint` for server pinning; mTLS authenticates the client, pinning authenticates the server.
-5. Pilot with a device group, make mTLS mandatory, then drop the shared secret.
+5. Pilot with a device group, make mTLS mandatory, then drop the shared secret (or keep it only as the bootstrap credential).
 
-Either path needs contract amendments in `docs/contracts/` before code changes, and a new Pester suite for the auth step.
+mTLS needs contract amendments in `docs/contracts/` before code changes, and a new Pester suite for the auth step.
 
 ## 9. Known v1 limitations
 
 | # | Limitation | Impact / mitigation |
 |---|---|---|
-| 1 | One fleet-wide shared secret; no dual-secret rotation | section 2; rotation is a planned short outage |
+| 1 | The fleet-wide shared secret still guards `/enroll` and every request; no dual-secret rotation. A stolen secret can enroll new hostnames and claim a hostname after an admin `/reset` until it re-enrolls | sections 2.2 and 2.4; rotation is a planned short outage; per-device mTLS is the next step (8.2) |
 | 2 | Hub is a single point of failure (one process, one SQLite file, no HA) | during an outage there are no commands or events; local watchdogs keep protecting; back up regularly |
 | 3 | No result retry queue | if `/result` fails the agent only logs it; the command ends as `timeout` on the hub although it may have run |
 | 4 | Commands expire after `command_timeout_sec` (300 s), also while still `pending` | commands for offline hosts are lost, not queued |
@@ -212,10 +227,10 @@ Either path needs contract amendments in `docs/contracts/` before code changes, 
 | 9 | Events are stored but not pushed to Telegram; no acknowledge flow | check `/events` or the panel; `event.ack` is unused |
 | 10 | No retention for `events`, `commands`, `audit_log` | prune manually; see `docs/OPERATIONS.md` |
 | 11 | Audit log is not tamper-proof; unauthenticated rejects write a row each | section 6 |
-| 12 | Device identity is the hostname; the device id is not bound to the caller | cloned or renamed machines collide; see 2.2 and 2.4 |
+| 12 | Device identity is the hostname plus its token; neither is bound to the caller's network identity | cloned or renamed machines collide (409 until `/reset`); a copied `agent.config.json` carries the token; see 2.2 and 2.4 |
 | 13 | Hub compromise controls the fleet, including the allow-list the agents obey | section 2.3 |
-| 14 | `trusted_server_thumbprint` is not pushable and pins the leaf certificate | renewals that change the certificate need a fleet update |
+| 14 | `trusted_server_thumbprint` is not pushable and pins the leaf certificate | use the 5-year self-signed certificate for fleets; renewals that change the certificate (Let's Encrypt every 60 to 90 days) need a fleet update |
 | 15 | Clock dependence: skew over 300 s means 408 | keep time sync healthy |
-| 16 | `quarantined` device status exists but nothing sets or enforces it | reserved for per-device credentials |
+| 16 | `quarantined` device status exists but nothing sets or enforces it | revocation is done with `/reset <host>` instead |
 | 17 | Hub and agent target Windows PowerShell 5.1; the tasks run scripts with `-ExecutionPolicy Bypass` | keep `C:\Program Files\SCGuardian` writable by Administrators only |
 | 18 | The TLS `netsh` application id in `HttpServer.psm1` differs from the one in `cert-setup.ps1` | cosmetic inconsistency; keep `listen.cert_thumbprint` aligned with the bound certificate |

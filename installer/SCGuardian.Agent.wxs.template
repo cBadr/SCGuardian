@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="SCGuardian Agent"
+           Manufacturer="Badr"
+           Version="{{VERSION}}"
+           UpgradeCode="{{UPGRADE_CODE}}"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of SCGuardian Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <!-- Public properties: msiexec /i SCGuardian.Agent.msi HUBURL=... SHAREDSECRET=... [THUMBPRINT=...] -->
+    <Property Id="HUBURL" Secure="yes" />
+    <Property Id="SHAREDSECRET" Secure="yes" Hidden="yes" />
+    <Property Id="THUMBPRINT" Secure="yes" />
+
+    <!-- Deferred CustomActionData carries the secret: keep it out of the verbose log. -->
+    <Property Id="CA_InstallAgent" Value="-" Hidden="yes" />
+    <Property Id="CA_RemoveAgent" Value="-" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="SCGuardian">
+        <Directory Id="MODULESDIR" Name="modules" />
+      </Directory>
+    </StandardDirectory>
+
+    <ComponentGroup Id="AgentFiles">
+{{COMPONENTS}}
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="SCGuardian Agent" Level="1">
+      <ComponentGroupRef Id="AgentFiles" />
+    </Feature>
+
+    <!-- WixQuietExec reads its command line from the CustomActionData property named after the action. -->
+    <SetProperty Id="CA_InstallAgent" Sequence="execute" Before="CA_InstallAgent" Condition="NOT (REMOVE=&quot;ALL&quot;)"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]Install-Agent.ps1&quot; -Action Install -HubUrl &quot;[HUBURL]&quot; -SharedSecret &quot;[SHAREDSECRET]&quot; -Thumbprint &quot;[THUMBPRINT]&quot;" />
+
+    <SetProperty Id="CA_RemoveAgent" Sequence="execute" Before="CA_RemoveAgent" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE"
+                 Value="&quot;[System64Folder]WindowsPowerShell\v1.0\powershell.exe&quot; -NoProfile -NonInteractive -ExecutionPolicy Bypass -File &quot;[INSTALLFOLDER]Install-Agent.ps1&quot; -Action Uninstall" />
+
+    <CustomAction Id="CA_InstallAgent" DllEntry="WixQuietExec64" BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred" Impersonate="no" Return="check" />
+    <CustomAction Id="CA_RemoveAgent" DllEntry="WixQuietExec64" BinaryRef="Wix4UtilCA_X64"
+                  Execute="deferred" Impersonate="no" Return="ignore" />
+
+    <InstallExecuteSequence>
+      <Custom Action="CA_InstallAgent" After="InstallFiles" Condition="NOT (REMOVE=&quot;ALL&quot;)" />
+      <Custom Action="CA_RemoveAgent" Before="RemoveFiles" Condition="REMOVE=&quot;ALL&quot; AND NOT UPGRADINGPRODUCTCODE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>

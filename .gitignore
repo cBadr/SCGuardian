@@ -1,0 +1,25 @@
+# build output and test results
+artifacts/
+staging/
+tests/results.xml
+*.msi
+*.exe
+*.wixpdb
+
+# runtime data and secrets (never commit)
+*.db
+*.db-wal
+*.db-shm
+*.log
+*.pfx
+*.key
+*.env
+hub.config.json
+agent.config.json
+SCGuardian.config.json
+hub-cert.cer
+
+# editor / OS
+.vscode/
+.idea/
+Thumbs.db

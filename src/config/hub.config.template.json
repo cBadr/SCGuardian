@@ -1,0 +1,28 @@
+{
+  "listen": {
+    "url": "https://+:8443/",
+    "cert_thumbprint": "auto"
+  },
+  "shared_secret": "REPLACE_ME",
+  "telegram": {
+    "bot_token": "REPLACE_ME",
+    "chat_id": "-100...",
+    "admin_user_ids": ["123456789"],
+    "admin_usernames": ["Idlexaz"]
+  },
+  "database": {
+    "path": "C:\\ProgramData\\SCGuardian\\hub.db"
+  },
+  "defaults": {
+    "allowed_ids": ["5d0931a9fafc2a8b", "4c37282122b38af3"],
+    "scan_interval_sec": 60,
+    "heartbeat_sec": 60,
+    "alert_throttle_min": 15,
+    "command_confirm_sec": 300,
+    "stale_after_min": 5
+  },
+  "logging": {
+    "path": "C:\\ProgramData\\SCGuardian\\hub.log",
+    "max_bytes": 5242880
+  }
+}

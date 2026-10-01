@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:bal="http://wixtoolset.org/schemas/v4/wxs/bal">
+  <!-- The standard BA has NO free-text input. Values arrive on the command line:
+       SCGuardian.Agent.Setup.exe /quiet HubUrl=https://hub:8443 SharedSecret=xxxx
+       For an interactive prompt use Setup.ps1 instead. -->
+  <Bundle Name="SCGuardian Agent" Manufacturer="Badr" Version="{{VERSION}}"
+          UpgradeCode="{{BUNDLE_UPGRADE_CODE}}">
+    <BootstrapperApplication>
+      <bal:WixStandardBootstrapperApplication Theme="hyperlinkLicense" LicenseUrl="" />
+    </BootstrapperApplication>
+
+    <Variable Name="HubUrl" Type="string" Value="" bal:Overridable="yes" />
+    <Variable Name="SharedSecret" Type="string" Value="" Hidden="yes" bal:Overridable="yes" />
+    <Variable Name="Thumbprint" Type="string" Value="" bal:Overridable="yes" />
+
+    <Chain>
+      <MsiPackage Id="AgentMsi" SourceFile="{{MSI_PATH}}" Visible="no">
+        <MsiProperty Name="HUBURL" Value="[HubUrl]" />
+        <MsiProperty Name="SHAREDSECRET" Value="[SharedSecret]" />
+        <MsiProperty Name="THUMBPRINT" Value="[Thumbprint]" />
+      </MsiPackage>
+    </Chain>
+  </Bundle>
+</Wix>

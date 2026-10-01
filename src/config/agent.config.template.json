@@ -1,0 +1,14 @@
+{
+  "hub_url": "https://ostazna.pro:8443",
+  "shared_secret": "REPLACE_ME",
+  "device_id": null,
+  "hostname": "AUTO",
+  "heartbeat_sec": 60,
+  "scan_interval_sec": 60,
+  "alert_throttle_min": 15,
+  "allowed_ids": ["5d0931a9fafc2a8b", "4c37282122b38af3"],
+  "layers": ["Recovery", "FolderAcl", "ServiceSd", "RegistryAcl"],
+  "take_ownership": false,
+  "local_watchdog": true,
+  "trusted_server_thumbprint": ""
+}

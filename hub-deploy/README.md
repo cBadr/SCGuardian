@@ -8,6 +8,69 @@ The Hub is a PowerShell process (`SCGuardian.ps1 -Mode Hub`) that serves the age
 
 Requirements: Windows Server/10+ with Windows PowerShell 5.1, an elevated prompt, a public IP.
 
+## One-command setup (recommended)
+
+Open **Windows PowerShell as Administrator** on the Hub server and run:
+
+```powershell
+Invoke-WebRequest -UseBasicParsing -Uri https://raw.githubusercontent.com/cBadr/SCGuardian/main/hub-deploy/Setup-Hub.ps1 -OutFile "$env:TEMP\Setup-Hub.ps1"
+powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\Setup-Hub.ps1"
+```
+
+Defaults: `-Domain ostazna.pro -Port 8443 -Version 4.0.1`. The script prints numbered steps:
+
+| Step | What happens |
+|---|---|
+| 0 | Admin and Windows PowerShell 5.1 check, TLS 1.2 |
+| 1 | Cleanup, only with `-Reinstall` |
+| 2 | Downloads `v<Version>` source from GitHub to `%TEMP%` (skip with `-SourceRoot <extracted repo>`) |
+| 3 | Runs `install-hub.ps1` (program files, locked data folder, firewall rule, scheduled task) |
+| 4 | Completes `hub.config.json`: keeps every value already set, generates `shared_secret` (64 hex, never shown) and asks **only** for Telegram fields that still hold placeholders (bot token input is hidden) |
+| 5 | Certificate: reuses the pinned certificate if it is valid (re-runs never change the thumbprint), otherwise creates a self-signed one with `cert-setup.ps1 -SelfSigned` |
+| 6 | Restarts `SCGuardian-Hub` and waits up to 30 s for the port |
+| 7 | Signed health check on `https://localhost:<Port>/api/v1/health`, certificate pinned by thumbprint; on failure it prints the last 15 log lines (secrets masked) and exits 1 |
+| 8 | Writes `C:\ProgramData\SCGuardian\agent-bootstrap.ps1` (SYSTEM + Administrators only) |
+
+Flags:
+
+| Flag | Effect |
+|---|---|
+| `-Reinstall` | Stops/unregisters the task, removes the firewall rule and deletes `C:\Program Files\SCGuardian`. Config, database and certificate in `C:\ProgramData\SCGuardian` are **kept** |
+| `-NewCert` | Forces a new self-signed certificate. Every agent then needs the regenerated bootstrap |
+| `-WhatIf` | Shows every change without making it |
+| `-SkipHealthCheck` | Skips step 7 |
+| `-Desktop` | Also copies `agent-bootstrap.ps1` to your Desktop |
+
+The command is safe to re-run (for example after a failed step or to regenerate the bootstrap).
+
+### Agent bootstrap
+
+`agent-bootstrap.ps1` is rendered from `agent-bootstrap.template.ps1` with this Hub's URL, shared secret,
+certificate thumbprint, version and the SHA-256 of `SCGuardian.Agent.Setup.exe` (read from the release
+`SHA256SUMS.txt`). Copy it to each device over a **private channel** and run as Administrator:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\agent-bootstrap.ps1
+```
+
+It downloads the agent setup, verifies the SHA-256 (aborts and deletes on mismatch), installs silently,
+checks the `SCGuardian-Agent` task and waits up to 60 s for enrollment (exit 0 enrolled, 1 failed,
+2 installed but not enrolled yet). Delete the file afterwards.
+
+> **The bootstrap contains the shared secret.** Per-device tokens limit what a leaked secret can do to
+> enrolled devices, but it can still enroll **new** hostnames. If it leaks: clear `shared_secret` in
+> `hub.config.json`, re-run the setup command and redeploy the new bootstrap.
+
+Re-enrolling a device that was reinstalled with the same hostname: send `/reset <hostname>` to the
+Telegram bot; the agent enrolls again on its next cycle.
+
+Still required outside the server: the DNS `A` record and the inbound **TCP 8443** rule on the router or
+cloud firewall (section 1 below).
+
+---
+
+# Manual installation
+
 ## 1. DNS and ports
 
 1. Create an `A` record `ostazna.pro` pointing to the Hub's public IP.

@@ -18,7 +18,7 @@ if (-not $wix) {
     Write-Host 'WiX v4 CLI not found. Install it with:' -ForegroundColor Red
     Write-Host '  dotnet tool install --global wix' -ForegroundColor Yellow
     Write-Host '  wix extension add --global WixToolset.Util.wixext' -ForegroundColor Yellow
-    Write-Host '  wix extension add --global WixToolset.BootstrapperApplications.wixext   (only for -Bundle)' -ForegroundColor Yellow
+    Write-Host '  wix extension add --global WixToolset.Bal.wixext   (only for -Bundle)' -ForegroundColor Yellow
     exit 2
 }
 
@@ -40,7 +40,7 @@ Copy-Item (Join-Path $PSScriptRoot 'Setup.ps1') $outAbs -Force
 if ($Bundle) {
     $bwxs = Join-Path $outAbs 'Bootstrapper.wxs'
     $null = New-BootstrapperWxs -TemplatePath (Join-Path $PSScriptRoot 'Bootstrapper.wxs.template') -Version $Version -MsiPath $msi -OutputPath $bwxs
-    & wix build -ext WixToolset.BootstrapperApplications.wixext -o (Join-Path $outAbs 'SCGuardian.Agent.Setup.exe') $bwxs
+    & wix build -ext WixToolset.Bal.wixext -o (Join-Path $outAbs 'SCGuardian.Agent.Setup.exe') $bwxs
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 Write-Host "Done: $msi (Configuration=$Configuration, Version=$Version)" -ForegroundColor Green

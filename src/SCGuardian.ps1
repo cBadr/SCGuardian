@@ -960,6 +960,9 @@ $AgentStopFile = Join-Path $Root 'agent.stop'
 function Get-ScgEntryModuleDir {
     $candidates = @()
     if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot 'modules') }
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = $PSCommandPath }
+    if ($selfPath) { $candidates += (Join-Path (Split-Path -Parent $selfPath) 'modules') }
     $candidates += 'C:\Program Files\SCGuardian\modules'
     foreach ($d in $candidates) {
         if (Test-Path (Join-Path $d 'Common.psm1')) { return $d }

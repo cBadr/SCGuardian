@@ -14,7 +14,7 @@
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
-    [string]$SourceRoot = (Split-Path -Parent $PSScriptRoot),
+    [string]$SourceRoot,
     [string]$InstallDir = 'C:\Program Files\SCGuardian',
     [string]$ConfigPath = 'C:\ProgramData\SCGuardian\hub.config.json',
     [int]$Port = 8443,
@@ -23,6 +23,14 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# $PSScriptRoot can be empty inside a param() default on some hosts, so resolve the default here.
+if (-not $SourceRoot) {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = $PSCommandPath }
+    if (-not $selfPath) { throw 'Cannot determine the script location; pass -SourceRoot <repo root>.' }
+    $SourceRoot = Split-Path -Parent (Split-Path -Parent $selfPath)
+}
 
 $TaskName = 'SCGuardian-Hub'
 $RuleName = 'SCGuardian Hub'

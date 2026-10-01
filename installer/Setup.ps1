@@ -5,9 +5,15 @@ param(
     [string]$HubUrl,
     [securestring]$SharedSecret,
     [string]$Thumbprint,
-    [string]$MsiPath = (Join-Path $PSScriptRoot 'SCGuardian.Agent.msi')
+    [string]$MsiPath
 )
 $ErrorActionPreference = 'Stop'
+
+if (-not $MsiPath) {
+    $selfPath = $MyInvocation.MyCommand.Path
+    if (-not $selfPath) { $selfPath = $PSCommandPath }
+    if ($selfPath) { $MsiPath = Join-Path (Split-Path -Parent $selfPath) 'SCGuardian.Agent.msi' }
+}
 
 if (-not (Test-Path $MsiPath)) { Write-Host "MSI not found: $MsiPath" -ForegroundColor Red; exit 1 }
 if (-not $HubUrl)       { $HubUrl = Read-Host 'Hub URL (https://host:port)' }

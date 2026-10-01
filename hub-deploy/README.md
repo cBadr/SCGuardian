@@ -39,7 +39,8 @@ If the config still contains `REPLACE_ME`, the task is registered but not starte
 | `database.path`, `logging.path`, `logging.max_bytes` | storage locations |
 | `defaults.*` | `allowed_ids`, `scan_interval_sec`, `heartbeat_sec`, `alert_throttle_min`, `command_confirm_sec`, `stale_after_min` |
 
-Generate a secret: `[Convert]::ToBase64String((1..32 | % { [byte](Get-Random -Max 256) }))`.
+Generate a secret (CSPRNG, hex so it is safe on msiexec/command lines):
+`$b = New-Object byte[] 32; [Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($b); ([BitConverter]::ToString($b) -replace '-','').ToLower()`.
 Never commit real secrets.
 
 ## 4. Certificate

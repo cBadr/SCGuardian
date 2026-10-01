@@ -397,6 +397,156 @@ Describe 'Invoke-ScgAgentCommand' {
     }
 }
 
+Describe 'Invoke-ScgAgentCommand update' {
+    BeforeAll {
+        $script:UpdBytes = [System.Text.Encoding]::ASCII.GetBytes('fake-setup-binary-for-tests')
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        try { $h = $sha.ComputeHash($script:UpdBytes) } finally { $sha.Dispose() }
+        $script:UpdHash = -join @($h | ForEach-Object { $_.ToString('x2') })
+        $script:UpdUrl = 'https://github.com/cBadr/SCGuardian/releases/download/v4.9.9/SCGuardian.Agent.Setup.exe'
+        $script:UpdDir = Join-Path $TestDrive 'update'
+        $script:UpdCfg = [pscustomobject]@{ allowed_ids = @('aaaaaaaaaaaaaaaa'); layers = @('ServiceSd'); take_ownership = $false; shared_secret = 'test-secret-value' }
+
+        function New-UpdateCommand {
+            param([string]$Version = '4.9.9', [string]$Url = $script:UpdUrl, [string]$Sha = $script:UpdHash)
+            return [pscustomobject]@{ id = 'u1'; type = 'update'; payload = [pscustomobject]@{ version = $Version; setup_url = $Url; sha256 = $Sha } }
+        }
+        function Get-UpdateExe {
+            if (-not (Test-Path -LiteralPath $script:UpdDir)) { return @() }
+            return @(Get-ChildItem -LiteralPath $script:UpdDir -Filter '*.exe' -File)
+        }
+    }
+    BeforeEach {
+        if (Test-Path -LiteralPath $script:UpdDir) { Remove-Item -LiteralPath $script:UpdDir -Recurse -Force }
+        Mock Write-ScgLog {} -ModuleName Agent
+        Mock Get-ScAgent { @() } -ModuleName Agent
+        Mock Initialize-ScgSecureDirectory { $null = New-Item -ItemType Directory -Path $Path -Force; $true } -ModuleName Agent
+        Mock Invoke-WebRequest { [System.IO.File]::WriteAllBytes($OutFile, [System.Text.Encoding]::ASCII.GetBytes('fake-setup-binary-for-tests')) } -ModuleName Agent
+        Mock Get-ScheduledTask { $null } -ModuleName Agent
+        Mock Register-ScheduledTask {} -ModuleName Agent
+        Mock Unregister-ScheduledTask {} -ModuleName Agent
+        Mock Start-Process {} -ModuleName Agent
+    }
+    It 'already on the requested version short-circuits without downloading' {
+        $current = InModuleScope Agent { $script:AgentVersion }
+        $upper = ([string]$current).ToUpperInvariant()
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand -Version $upper) -Config $script:UpdCfg
+        $r.ok | Should -BeTrue
+        $r.output | Should -Be ('already on ' + $upper)
+        Should -Invoke Invoke-WebRequest -ModuleName Agent -Times 0 -Exactly
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+        Should -Invoke Get-ScAgent -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'rejects a non-https setup_url' {
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand -Url 'http://github.com/cBadr/SCGuardian/releases/download/v4.9.9/SCGuardian.Agent.Setup.exe') -Config $script:UpdCfg
+        $r.ok | Should -BeFalse
+        Should -Invoke Invoke-WebRequest -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'rejects a disallowed host, IP or lookalike' -TestCases @(
+        @{ Url = 'https://github.com.evil.com/a/SCGuardian.Agent.Setup.exe' }
+        @{ Url = 'https://evil.com/github.com/SCGuardian.Agent.Setup.exe' }
+        @{ Url = 'https://140.82.121.4/SCGuardian.Agent.Setup.exe' }
+        @{ Url = 'https://evilgithubusercontent.com/SCGuardian.Agent.Setup.exe' }
+        @{ Url = 'https://github.com@evil.com/SCGuardian.Agent.Setup.exe' }
+        @{ Url = 'https://github.com:8443/SCGuardian.Agent.Setup.exe' }
+    ) {
+        param($Url)
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand -Url $Url) -Config $script:UpdCfg
+        $r.ok | Should -BeFalse
+        $r.output | Should -Match 'setup_url'
+        Should -Invoke Invoke-WebRequest -ModuleName Agent -Times 0 -Exactly
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'accepts the release asset CDN hosts' {
+        InModuleScope Agent {
+            Test-ScgUpdateUrl -Url 'https://objects.githubusercontent.com/github-production-release-asset/x' | Should -BeTrue
+            Test-ScgUpdateUrl -Url 'https://release-assets.githubusercontent.com/x' | Should -BeTrue
+            Test-ScgUpdateUrl -Url 'https://GitHub.com/cBadr/x' | Should -BeTrue
+        }
+    }
+    It 'rejects a short, uppercase or non-hex sha256' -TestCases @(
+        @{ Sha = 'abc123' }
+        @{ Sha = ('A' * 64) }
+        @{ Sha = ('g' * 64) }
+        @{ Sha = ('a' * 65) }
+        @{ Sha = '' }
+    ) {
+        param($Sha)
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand -Sha $Sha) -Config $script:UpdCfg
+        $r.ok | Should -BeFalse
+        $r.output | Should -Match 'sha256'
+        Should -Invoke Invoke-WebRequest -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'valid flow downloads, verifies and registers the transient task with a quiet, property-free action' {
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand) -Config $script:UpdCfg
+        $r.ok | Should -BeTrue
+        $r.output | Should -Be 'update task scheduled for 4.9.9'
+        $exe = @(Get-UpdateExe)
+        $exe.Count | Should -Be 1
+        $exe[0].Name | Should -Match '^SCGuardian\.Agent\.Setup\.[0-9a-f]{8}\.exe$'
+        $script:ExpectedExe = $exe[0].FullName
+        Should -Invoke Initialize-ScgSecureDirectory -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Path -eq $script:UpdDir }
+        Should -Invoke Invoke-WebRequest -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $Uri -eq $script:UpdUrl }
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 1 -Exactly -ParameterFilter {
+            $a = [string]$Action[0].Arguments
+            ($TaskName -eq 'SCGuardian-Agent-Update') -and
+            ([string]$Action[0].Execute -eq 'powershell.exe') -and
+            $a.Contains('/quiet') -and
+            $a.Contains($script:ExpectedExe) -and
+            $a.Contains("Unregister-ScheduledTask -TaskName 'SCGuardian-Agent-Update'") -and
+            ($a -notmatch 'HUBURL|SHAREDSECRET|THUMBPRINT') -and
+            ([string]$Principal.UserId -eq 'SYSTEM')
+        }
+        Should -Invoke Start-Process -ModuleName Agent -Times 0 -Exactly
+        Should -Invoke Unregister-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'hash mismatch deletes the downloaded file and reports both hashes' {
+        $wrong = 'f' * 64
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand -Sha $wrong) -Config $script:UpdCfg
+        $r.ok | Should -BeFalse
+        $r.output | Should -Match $wrong
+        $r.output | Should -Match $script:UpdHash
+        @(Get-UpdateExe).Count | Should -Be 0
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'a failed download leaves no file behind' {
+        Mock Invoke-WebRequest { [System.IO.File]::WriteAllBytes($OutFile, [byte[]]@(1, 2)); throw 'connection reset' } -ModuleName Agent
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand) -Config $script:UpdCfg
+        $r.ok | Should -BeFalse
+        $r.output | Should -Match 'connection reset'
+        @(Get-UpdateExe).Count | Should -Be 0
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+    }
+    It 'a stale pending update task is removed and a new one registered' {
+        Mock Get-ScheduledTask { [pscustomobject]@{ TaskName = 'SCGuardian-Agent-Update'; Description = 'SCGuardian self-update registered_utc=2020-01-01T00:00:00.000Z version=4.9.8' } } -ModuleName Agent
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand) -Config $script:UpdCfg
+        $r.ok | Should -BeTrue
+        $r.output | Should -Be 'update task scheduled for 4.9.9'
+        Should -Invoke Unregister-ScheduledTask -ModuleName Agent -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'SCGuardian-Agent-Update' }
+        Should -Invoke Write-ScgLog -ModuleName Agent -ParameterFilter { $Level -eq 'WARN' -and $Result -eq 'stale_removed' }
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 1 -Exactly
+    }
+    It 'a fresh pending update task is kept and nothing is downloaded again' {
+        Mock Get-ScheduledTask {
+            $iso = [datetime]::UtcNow.AddMinutes(-1).ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [System.Globalization.CultureInfo]::InvariantCulture)
+            [pscustomobject]@{ TaskName = 'SCGuardian-Agent-Update'; Description = ('SCGuardian self-update registered_utc=' + $iso + ' version=4.9.9') }
+        } -ModuleName Agent
+        $r = Invoke-ScgAgentCommand -Command (New-UpdateCommand) -Config $script:UpdCfg
+        $r.ok | Should -BeTrue
+        $r.output | Should -Match 'pending'
+        Should -Invoke Invoke-WebRequest -ModuleName Agent -Times 0 -Exactly
+        Should -Invoke Register-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+        Should -Invoke Unregister-ScheduledTask -ModuleName Agent -Times 0 -Exactly
+        @(Get-UpdateExe).Count | Should -Be 0
+    }
+    It 'masks the setup_url querystring in logs' {
+        $u = 'https://evil.com/x.exe?token=supersecretvalue'
+        $null = Invoke-ScgAgentCommand -Command (New-UpdateCommand -Url $u) -Config $script:UpdCfg
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 0 -Exactly -ParameterFilter { $Message -match 'supersecretvalue' }
+        Should -Invoke Write-ScgLog -ModuleName Agent -Times 1 -ParameterFilter { $Message -match 'evil\.com/x\.exe\?\*\*\*' }
+    }
+}
+
 Describe 'Invoke-ScgAgentCycle' {
     BeforeEach {
         Remove-Item -LiteralPath $script:StatePath -Force -ErrorAction SilentlyContinue

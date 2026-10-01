@@ -8,7 +8,9 @@
            Scope="perMachine"
            Compressed="yes">
 
-    <MajorUpgrade DowngradeErrorMessage="A newer version of SCGuardian Agent is already installed." />
+    <!-- AllowDowngrades: an operator-issued emergency /update to an older version (self-update.md)
+         must not be silently blocked by Windows Installer's default anti-downgrade check. -->
+    <MajorUpgrade AllowDowngrades="yes" />
     <MediaTemplate EmbedCab="yes" />
 
     <!-- Public properties: msiexec /i SCGuardian.Agent.msi HUBURL=... SHAREDSECRET=... [THUMBPRINT=...] -->

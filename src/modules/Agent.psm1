@@ -3,6 +3,8 @@
     SCGuardian Agent module: config, hub client, command execution, local watchdog, backoff.
 .DESCRIPTION
     Purpose : the endpoint agent cycle (watchdog first, then enroll/heartbeat/commands/results/events).
+              Supported hub command types: harden, restore, remove, status, agents, ping, update
+              (update = SHA-256 pinned self-update through a transient scheduled task, see docs/contracts/self-update.md).
     Author  : Badr
     Version : 4.0.0
     Depends : Common.psm1, Discovery.psm1, Hardening.psm1
@@ -25,6 +27,13 @@ $script:ErrNotEnrolled = 'hub http 401: device not enrolled'
 $script:ErrBadToken = 'hub http 401: invalid device token'
 $script:ErrUnknownDevice = 'hub http 404: unknown device'
 $script:ErrEnrollConflict = 'hub http 409: hostname already enrolled'
+$script:UpdateTaskName = 'SCGuardian-Agent-Update'
+$script:UpdateStaleMin = 10
+$script:UpdateDelaySec = 5
+$script:UpdateExpireMin = 30
+$script:UpdateDownloadTimeoutSec = 300
+$script:UpdateHostAllow = @('github.com', 'objects.githubusercontent.com')
+$script:UpdateHostSuffix = '.githubusercontent.com'
 
 function Get-ScgProp {
     <#
@@ -624,13 +633,261 @@ function ConvertTo-ScgCommandPayload {
     return $Payload
 }
 
+function Get-ScgMaskedUrl {
+    <#
+    .SYNOPSIS
+        Returns a URL safe for logs: anything after the first ? or # is replaced with ***.
+    .PARAMETER Url
+        Raw URL (may be invalid).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter()][AllowNull()][AllowEmptyString()][string]$Url)
+    if ([string]::IsNullOrEmpty($Url)) { return '' }
+    $i = $Url.IndexOfAny([char[]]@('?', '#'))
+    if ($i -ge 0) { return $Url.Substring(0, $i) + '?***' }
+    return $Url
+}
+
+function Test-ScgUpdateUrl {
+    <#
+    .SYNOPSIS
+        True when Url is an absolute https URL on the default port whose DNS host is exactly github.com,
+        objects.githubusercontent.com or a subdomain of githubusercontent.com (strict equality / dot-suffix, never substring).
+    .PARAMETER Url
+        Candidate setup_url.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter()][AllowNull()][AllowEmptyString()][string]$Url)
+    if ([string]::IsNullOrWhiteSpace($Url)) { return $false }
+    $uri = $null
+    if (-not [System.Uri]::TryCreate($Url, [System.UriKind]::Absolute, [ref]$uri)) { return $false }
+    if ($uri.Scheme -cne 'https') { return $false }
+    if ($uri.HostNameType -ne [System.UriHostNameType]::Dns) { return $false }
+    if (-not [string]::IsNullOrEmpty($uri.UserInfo)) { return $false }
+    if ($uri.Port -ne 443) { return $false }
+    $h = $uri.Host.ToLowerInvariant()
+    if ($script:UpdateHostAllow -ccontains $h) { return $true }
+    $suffix = $script:UpdateHostSuffix
+    if ($h.Length -gt $suffix.Length -and $h.EndsWith($suffix, [System.StringComparison]::Ordinal)) { return $true }
+    return $false
+}
+
+function Test-ScgSha256Hex {
+    <#
+    .SYNOPSIS
+        True when Value is exactly 64 lowercase hex characters.
+    .PARAMETER Value
+        Candidate sha256.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param([Parameter()][AllowNull()][AllowEmptyString()][string]$Value)
+    if ($null -eq $Value) { return $false }
+    return ($Value -cmatch '^[0-9a-f]{64}$')
+}
+
+function Get-ScgFileSha256 {
+    <#
+    .SYNOPSIS
+        Computes the SHA-256 of a file as 64 lowercase hex characters.
+    .PARAMETER Path
+        File path.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$Path)
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        try { $bytes = $sha.ComputeHash($fs) } finally { $fs.Dispose() }
+    }
+    finally { $sha.Dispose() }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($b in $bytes) { [void]$sb.Append($b.ToString('x2')) }
+    return $sb.ToString()
+}
+
+function Get-ScgUpdateTaskArgument {
+    <#
+    .SYNOPSIS
+        Builds the powershell.exe argument string of the transient update task (self-update.md step 4, verbatim shape).
+    .DESCRIPTION
+        Runs Setup.exe with /quiet only (no HUBURL/SHAREDSECRET/THUMBPRINT: Install-Agent.ps1 keeps agent.config.json),
+        then unregisters the task and removes the exe.
+    .PARAMETER SetupPath
+        Full path of the verified Setup.exe.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory)][string]$SetupPath)
+    $q = $SetupPath.Replace("'", "''")
+    $tpl = '-NoProfile -WindowStyle Hidden -Command "Start-Process -FilePath ''{0}'' -ArgumentList ''/quiet'' -Wait; Unregister-ScheduledTask -TaskName ''{1}'' -Confirm:$false; Remove-Item ''{0}'' -Force"'
+    return ($tpl -f $q, $script:UpdateTaskName)
+}
+
+function Get-ScgUpdateTaskAgeMin {
+    <#
+    .SYNOPSIS
+        Minutes since an existing update task was registered (Description registered_utc, else trigger StartBoundary); null when unknown.
+    .PARAMETER Task
+        Scheduled task object (or test double).
+    .PARAMETER Now
+        Current UTC time.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Task,
+        [Parameter(Mandatory)][datetime]$Now
+    )
+    $reg = $null
+    $desc = [string](Get-ScgProp $Task 'Description' '')
+    if ($desc -match 'registered_utc=(\S+)') {
+        try { $reg = ConvertFrom-ScgUtcIso -Value $Matches[1] } catch { $reg = $null }
+    }
+    if ($null -eq $reg) {
+        foreach ($t in (Get-ScgList $Task 'Triggers' @())) {
+            $sb = [string](Get-ScgProp $t 'StartBoundary' '')
+            if ($sb) {
+                try { $reg = ([datetime]::Parse($sb, [System.Globalization.CultureInfo]::InvariantCulture)).ToUniversalTime() } catch { $reg = $null }
+            }
+            if ($null -ne $reg) { break }
+        }
+    }
+    if ($null -eq $reg) { return $null }
+    return [double]($Now - $reg).TotalMinutes
+}
+
+function Register-ScgUpdateTask {
+    <#
+    .SYNOPSIS
+        Registers the one-time transient SCGuardian-Agent-Update task (SYSTEM, Highest, ~5 s from now, expires and self-deletes).
+    .PARAMETER SetupPath
+        Full path of the verified Setup.exe.
+    .PARAMETER Version
+        Target version (recorded in the task description only).
+    .PARAMETER Now
+        Current UTC time (recorded as registered_utc for the stale check).
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    param(
+        [Parameter(Mandatory)][string]$SetupPath,
+        [Parameter(Mandatory)][string]$Version,
+        [Parameter(Mandatory)][datetime]$Now
+    )
+    if (-not $PSCmdlet.ShouldProcess($script:UpdateTaskName, 'Register update task')) { return }
+    $localNow = Get-Date
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument (Get-ScgUpdateTaskArgument -SetupPath $SetupPath)
+    $trigger = New-ScheduledTaskTrigger -Once -At ($localNow.AddSeconds($script:UpdateDelaySec))
+    $trigger.EndBoundary = $localNow.AddMinutes($script:UpdateExpireMin).ToString('yyyy-MM-ddTHH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture)
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes $script:UpdateExpireMin) -DeleteExpiredTaskAfter (New-TimeSpan -Minutes 1)
+    $desc = 'SCGuardian self-update registered_utc=' + (ConvertTo-ScgUtcIso -InputObject $Now) + ' version=' + $Version
+    $null = Register-ScheduledTask -TaskName $script:UpdateTaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Description $desc -Force -ErrorAction Stop
+}
+
+function Invoke-ScgUpdateCommand {
+    <#
+    .SYNOPSIS
+        Handles command type update per self-update.md: version short-circuit, URL/hash validation, no stacking,
+        verified download into the locked update folder, transient task registration; never runs the installer itself.
+    .PARAMETER Payload
+        Normalized payload (version, setup_url, sha256).
+    .OUTPUTS
+        Hashtable with ok (bool) and output (string).
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param([Parameter()][AllowNull()][object]$Payload)
+    $version = [string](Get-ScgProp $Payload 'version' '')
+    $url = [string](Get-ScgProp $Payload 'setup_url' '')
+    $expected = [string](Get-ScgProp $Payload 'sha256' '')
+    $safeUrl = Get-ScgMaskedUrl -Url $url
+
+    if ([string]::IsNullOrWhiteSpace($version)) { return @{ ok = $false; output = 'update requires payload version' } }
+    if ([string]::Equals([string]$script:AgentVersion, $version, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return @{ ok = $true; output = "already on $version" }
+    }
+    if (-not (Test-ScgUpdateUrl -Url $url)) {
+        Write-ScgLog -Message "update rejected: setup_url not https on an allowed GitHub host ($safeUrl)" -Level WARN -Action 'command.update' -Result 'rejected'
+        return @{ ok = $false; output = 'update rejected: setup_url must be https on github.com or objects.githubusercontent.com' }
+    }
+    if (-not (Test-ScgSha256Hex -Value $expected)) {
+        Write-ScgLog -Message 'update rejected: sha256 is not 64 lowercase hex' -Level WARN -Action 'command.update' -Result 'rejected'
+        return @{ ok = $false; output = 'update rejected: sha256 must be exactly 64 lowercase hex characters' }
+    }
+
+    $nowUtc = [datetime]::UtcNow
+    $existing = $null
+    try { $existing = @(Get-ScheduledTask -TaskName $script:UpdateTaskName -ErrorAction Stop) | Where-Object { $null -ne $_ } | Select-Object -First 1 }
+    catch { $existing = $null }
+    if ($null -ne $existing) {
+        $age = Get-ScgUpdateTaskAgeMin -Task $existing -Now $nowUtc
+        if ($null -ne $age -and $age -le $script:UpdateStaleMin) {
+            $ageText = [string][math]::Round([double]$age, 1)
+            Write-ScgLog -Message "update pending: $($script:UpdateTaskName) registered $ageText min ago; not re-registering" -Level INFO -Action 'command.update' -Result 'pending'
+            return @{ ok = $true; output = "update pending: previous update task still scheduled ($ageText min old); not re-registering" }
+        }
+        $ageLabel = 'unknown age'
+        if ($null -ne $age) { $ageLabel = ([string][math]::Round([double]$age, 1)) + ' min old' }
+        Write-ScgLog -Message "stale update task removed ($ageLabel, installer likely failed silently)" -Level WARN -Action 'command.update' -Result 'stale_removed'
+        Unregister-ScheduledTask -TaskName $script:UpdateTaskName -Confirm:$false -ErrorAction Stop
+    }
+
+    $updateDir = Join-Path (Get-ScgRoot) 'update'
+    if (-not (Initialize-ScgSecureDirectory -Path $updateDir)) {
+        return @{ ok = $false; output = 'update failed: could not create or lock the update folder' }
+    }
+    $guid8 = ([string](New-ScgGuid)).Replace('-', '').Substring(0, 8)
+    $setupPath = Join-Path $updateDir ('SCGuardian.Agent.Setup.' + $guid8 + '.exe')
+    $query = ''
+    $qi = $url.IndexOfAny([char[]]@('?', '#'))
+    if ($qi -ge 0) { $query = $url.Substring($qi + 1) }
+
+    try {
+        $tls12 = [System.Net.SecurityProtocolType]::Tls12
+        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor $tls12
+        $oldProgress = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try { $null = Invoke-WebRequest -Uri $url -OutFile $setupPath -UseBasicParsing -TimeoutSec $script:UpdateDownloadTimeoutSec -ErrorAction Stop }
+        finally { $ProgressPreference = $oldProgress }
+        if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) { throw 'download produced no file' }
+        $actual = Get-ScgFileSha256 -Path $setupPath
+    }
+    catch {
+        Remove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue
+        $msg = Protect-Secret -Text $_.Exception.Message -Secret @($query)
+        Write-ScgLog -Message "update download failed from ${safeUrl}: $msg" -Level WARN -Action 'command.update' -Result 'failed'
+        return @{ ok = $false; output = "update download failed: $msg" }
+    }
+
+    if ($actual -cne $expected) {
+        Remove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue
+        Write-ScgLog -Message "update sha256 mismatch from ${safeUrl}: expected $expected actual $actual" -Level WARN -Action 'command.update' -Result 'hash_mismatch'
+        return @{ ok = $false; output = "update sha256 mismatch: expected $expected actual $actual (file deleted)" }
+    }
+
+    try { Register-ScgUpdateTask -SetupPath $setupPath -Version $version -Now $nowUtc -Confirm:$false }
+    catch {
+        Remove-Item -LiteralPath $setupPath -Force -ErrorAction SilentlyContinue
+        $msg = Protect-Secret -Text $_.Exception.Message -Secret @($query)
+        Write-ScgLog -Message "update task registration failed: $msg" -Level WARN -Action 'command.update' -Result 'failed'
+        return @{ ok = $false; output = "update task registration failed: $msg" }
+    }
+    Write-ScgLog -Message "update task scheduled for $version from $safeUrl" -Level INFO -Action 'command.update' -Result 'scheduled'
+    return @{ ok = $true; output = "update task scheduled for $version" }
+}
+
 function Invoke-ScgAgentCommand {
     <#
     .SYNOPSIS
-        Executes one hub command (harden, restore, remove, status, agents, ping) and returns ok/output.
+        Executes one hub command (harden, restore, remove, status, agents, ping, update) and returns ok/output.
     .DESCRIPTION
         Payload may carry sc_id (16 hex) to target one agent; harden and restore without sc_id target all of my agents;
         remove requires sc_id and goes only through Remove-ScAgent, which refuses allow-listed agents.
+        update (payload version, setup_url, sha256) is handled by Invoke-ScgUpdateCommand without discovery: it verifies
+        the download by SHA-256 and schedules the transient SCGuardian-Agent-Update task (self-update.md).
     .PARAMETER Command
         Object with id, type, payload.
     .PARAMETER Config
@@ -657,6 +914,7 @@ function Invoke-ScgAgentCommand {
     $backupDir = Join-Path (Get-ScgRoot) 'Backup'
     try {
         if ($type -eq 'ping') { return @{ ok = $true; output = 'pong' } }
+        if ($type -eq 'update') { return (Invoke-ScgUpdateCommand -Payload $payload) }
 
         $agents = @(Get-ScAgent -AllowedId $allowed)
         $mine = @($agents | Where-Object { $_.Authorized })

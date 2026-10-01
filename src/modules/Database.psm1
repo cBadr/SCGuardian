@@ -699,6 +699,48 @@ function Get-ScgScAgent {
     return $r
 }
 
+function Assert-ScgUpdatePayload {
+    <#
+    .SYNOPSIS
+        Throws ArgumentException naming the first invalid field of an update payload (version, setup_url, sha256).
+    .PARAMETER Payload
+        Payload as JSON text, hashtable or object.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowNull()][object]$Payload)
+    $obj = $Payload
+    if ($Payload -is [string]) {
+        try { $obj = ConvertFrom-Json -InputObject $Payload -ErrorAction Stop }
+        catch { $obj = $null }
+    }
+    if ($null -eq $obj -or $obj -is [string] -or $obj -is [System.ValueType] -or ($obj -is [System.Collections.IEnumerable] -and -not ($obj -is [System.Collections.IDictionary]))) {
+        throw (New-Object System.ArgumentException -ArgumentList "Invalid update payload field 'version': payload must be a JSON object with version, setup_url and sha256.", 'Payload')
+    }
+    $version = Get-ScgPropValue -Object $obj -Name 'version'
+    if (-not ($version -is [string]) -or [string]::IsNullOrWhiteSpace($version)) {
+        throw (New-Object System.ArgumentException -ArgumentList "Invalid update payload field 'version': must be a non-empty string.", 'Payload')
+    }
+    $url = Get-ScgPropValue -Object $obj -Name 'setup_url'
+    $urlOk = $false
+    if ($url -is [string] -and $url.Length -gt 0 -and $url -ceq $url.Trim()) {
+        $u = $null
+        if ([System.Uri]::TryCreate($url, [System.UriKind]::Absolute, [ref]$u)) {
+            $h = ([string]$u.Host).ToLowerInvariant()
+            $hostOk = $false
+            if ($h -ceq 'github.com' -or $h -ceq 'objects.githubusercontent.com') { $hostOk = $true }
+            elseif ($h.Length -gt '.githubusercontent.com'.Length -and $h.EndsWith('.githubusercontent.com', [System.StringComparison]::Ordinal) -and -not $h.StartsWith('.', [System.StringComparison]::Ordinal)) { $hostOk = $true }
+            if ($u.Scheme -ceq 'https' -and [string]::IsNullOrEmpty($u.UserInfo) -and $u.IsDefaultPort -and $hostOk) { $urlOk = $true }
+        }
+    }
+    if (-not $urlOk) {
+        throw (New-Object System.ArgumentException -ArgumentList "Invalid update payload field 'setup_url': must be an https URL on github.com, objects.githubusercontent.com or *.githubusercontent.com.", 'Payload')
+    }
+    $sha = Get-ScgPropValue -Object $obj -Name 'sha256'
+    if (-not ($sha -is [string]) -or -not ($sha -cmatch '\A[0-9a-f]{64}\z')) {
+        throw (New-Object System.ArgumentException -ArgumentList "Invalid update payload field 'sha256': must be exactly 64 lowercase hex characters.", 'Payload')
+    }
+}
+
 function New-ScgCommand {
     <#
     .SYNOPSIS
@@ -721,11 +763,12 @@ function New-ScgCommand {
     param(
         [Parameter(Mandatory = $true)][string]$Path,
         [Parameter(Mandatory = $true)][string]$DeviceId,
-        [Parameter(Mandatory = $true)][ValidateSet('harden', 'restore', 'remove', 'status', 'agents', 'ping')][string]$Type,
+        [Parameter(Mandatory = $true)][ValidateSet('harden', 'restore', 'remove', 'status', 'agents', 'ping', 'update')][string]$Type,
         [Parameter()][AllowNull()][object]$Payload,
         [Parameter()][string]$IssuedBy = 'system',
         [Parameter()][ValidateSet('telegram', 'system')][string]$IssuedVia = 'system'
     )
+    if ($Type -eq 'update') { Assert-ScgUpdatePayload -Payload $Payload }
     $pj = ConvertTo-ScgJsonText -Value $Payload
     if ($null -eq $pj) { $pj = '{}' }
     $conn = Open-ScgConnection -Path $Path
@@ -1112,4 +1155,174 @@ function Get-ScgHealthCounts {
     return [pscustomobject]@{ devices_online = [int]$d[0].n; commands_pending = [int]$c[0].n }
 }
 
-Export-ModuleMember -Function Initialize-ScgDatabase, Get-ScgSchemaVersion, Invoke-ScgMigration, Invoke-ScgSql, Register-ScgDevice, Update-ScgDeviceSeen, Test-ScgDeviceOnline, Set-ScgDeviceStatus, Set-ScgDeviceToken, Clear-ScgDeviceToken,Sync-ScgScAgent, Get-ScgDevice, Get-ScgScAgent, New-ScgCommand, Get-ScgDispatchableCommand, Get-ScgCommand, Complete-ScgCommand, Invoke-ScgCommandTimeout, Set-ScgStaleDevice, Add-ScgEvent, Get-ScgEvent, Confirm-ScgEvent, Add-ScgAudit, Get-ScgAudit, Get-ScgLastAudit, Get-ScgHealthCounts
+function Get-ScgIsoOffset {
+    <#
+    .SYNOPSIS
+        Returns an ISO timestamp shifted by the given minutes (negative goes back in time).
+    .PARAMETER Iso
+        Base timestamp, yyyy-MM-ddTHH:mm:ss.fffZ UTC.
+    .PARAMETER Minute
+        Minutes to add (may be negative).
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Iso,
+        [Parameter(Mandatory = $true)][double]$Minute
+    )
+    $styles = [System.Globalization.DateTimeStyles]::AssumeUniversal -bor [System.Globalization.DateTimeStyles]::AdjustToUniversal
+    $dt = [datetime]::ParseExact($Iso, 'yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture, $styles)
+    return (ConvertTo-ScgUtcIso -InputObject $dt.AddMinutes($Minute))
+}
+
+function Get-ScgFleetSummary {
+    <#
+    .SYNOPSIS
+        Fleet-wide counts in one query: devices, agents, pending commands, 24h failures and unacked events.
+    .PARAMETER Path
+        Database file path.
+    .PARAMETER StaleAfterMin
+        Online window in minutes.
+    .PARAMETER Now
+        Reference time (UTC ISO); defaults to the current time.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][int]$StaleAfterMin,
+        [Parameter()][string]$Now
+    )
+    if ([string]::IsNullOrEmpty($Now)) { $Now = Get-ScgUtcNow }
+    $onlineCut = Get-ScgIsoOffset -Iso $Now -Minute (-1 * $StaleAfterMin)
+    $dayCut = Get-ScgIsoOffset -Iso $Now -Minute (-1440)
+    $sql = @"
+SELECT
+ (SELECT COUNT(*) FROM devices) AS devices_total,
+ (SELECT COUNT(*) FROM devices WHERE status <> 'quarantined' AND last_seen >= @oc) AS devices_online,
+ (SELECT COUNT(*) FROM devices WHERE status <> 'quarantined' AND last_seen < @oc) AS devices_offline,
+ (SELECT COUNT(*) FROM devices WHERE status = 'quarantined') AS devices_quarantined,
+ (SELECT COUNT(*) FROM sc_agents) AS agents_total,
+ (SELECT COUNT(*) FROM sc_agents WHERE authorized = 1) AS agents_mine,
+ (SELECT COUNT(*) FROM sc_agents WHERE authorized = 0) AS agents_unknown,
+ (SELECT COUNT(DISTINCT device_id) FROM sc_agents WHERE authorized = 0) AS devices_with_unknown,
+ (SELECT COUNT(*) FROM commands WHERE status = 'pending') AS commands_pending,
+ (SELECT COUNT(*) FROM commands WHERE status = 'dispatched') AS commands_dispatched,
+ (SELECT COUNT(*) FROM commands WHERE status IN ('failed','timeout') AND COALESCE(finished_at, created_at) >= @dc) AS commands_failed_24h,
+ (SELECT COUNT(*) FROM events WHERE acked_at IS NULL AND created_at >= @dc AND severity = 'critical') AS events_critical_24h,
+ (SELECT COUNT(*) FROM events WHERE acked_at IS NULL AND created_at >= @dc AND severity = 'warn') AS events_warn_24h
+"@
+    $r = @(Invoke-ScgSql -Path $Path -Sql $sql -Parameter @{ oc = $onlineCut; dc = $dayCut })
+    $o = [ordered]@{}
+    foreach ($p in $r[0].PSObject.Properties) {
+        $v = 0
+        if ($null -ne $p.Value) { $v = [int]$p.Value }
+        $o[$p.Name] = $v
+    }
+    return [pscustomobject]$o
+}
+
+function Get-ScgDeviceAgentSummary {
+    <#
+    .SYNOPSIS
+        One row per device that has any agent or a failed command in the last 24h, from a single grouped query.
+    .PARAMETER Path
+        Database file path.
+    .PARAMETER Now
+        Reference time (UTC ISO); defaults to the current time.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter()][string]$Now
+    )
+    if ([string]::IsNullOrEmpty($Now)) { $Now = Get-ScgUtcNow }
+    $dayCut = Get-ScgIsoOffset -Iso $Now -Minute (-1440)
+    $sql = @"
+WITH a AS (
+ SELECT device_id,
+  COUNT(*) AS t,
+  SUM(CASE WHEN authorized = 1 THEN 1 ELSE 0 END) AS m,
+  SUM(CASE WHEN authorized = 0 THEN 1 ELSE 0 END) AS u,
+  SUM(CASE WHEN authorized = 1 AND state IS NOT NULL AND state <> '' AND state <> 'Running' THEN 1 ELSE 0 END) AS s
+ FROM sc_agents GROUP BY device_id
+), f AS (
+ SELECT device_id, COUNT(*) AS n
+ FROM commands
+ WHERE status IN ('failed','timeout') AND COALESCE(finished_at, created_at) >= @dc
+ GROUP BY device_id
+)
+SELECT ids.device_id AS device_id,
+ COALESCE(a.t, 0) AS agents_total,
+ COALESCE(a.m, 0) AS agents_mine,
+ COALESCE(a.u, 0) AS agents_unknown,
+ COALESCE(a.s, 0) AS agents_stopped,
+ COALESCE(f.n, 0) AS commands_failed_24h
+FROM (SELECT device_id FROM a UNION SELECT device_id FROM f) AS ids
+LEFT JOIN a ON a.device_id = ids.device_id
+LEFT JOIN f ON f.device_id = ids.device_id
+ORDER BY ids.device_id
+"@
+    $rows = @(Invoke-ScgSql -Path $Path -Sql $sql -Parameter @{ dc = $dayCut })
+    $out = New-Object System.Collections.ArrayList
+    foreach ($row in $rows) {
+        [void]$out.Add([pscustomobject][ordered]@{
+                device_id           = [string]$row.device_id
+                agents_total        = [int]$row.agents_total
+                agents_mine         = [int]$row.agents_mine
+                agents_unknown      = [int]$row.agents_unknown
+                agents_stopped      = [int]$row.agents_stopped
+                commands_failed_24h = [int]$row.commands_failed_24h
+            })
+    }
+    return $out.ToArray()
+}
+
+function Get-ScgRecentCommand {
+    <#
+    .SYNOPSIS
+        Latest commands of one device, newest first (id, type, status, created_at, finished_at, result_json).
+    .PARAMETER Path
+        Database file path.
+    .PARAMETER DeviceId
+        Device id.
+    .PARAMETER Last
+        Maximum rows, 1 to 20 (default 3).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$DeviceId,
+        [Parameter()][ValidateRange(1, 20)][int]$Last = 3
+    )
+    $r = @(Invoke-ScgSql -Path $Path -Sql 'SELECT id, type, status, created_at, finished_at, result_json FROM commands WHERE device_id=@d ORDER BY created_at DESC, id DESC LIMIT @n' -Parameter @{ d = $DeviceId; n = $Last })
+    return $r
+}
+
+function Get-ScgVersionDistribution {
+    <#
+    .SYNOPSIS
+        Devices grouped by agent_version (NULL/empty as 'unknown') from one grouped query: agent_version, device_count, newest_seen.
+    .PARAMETER Path
+        Database file path.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $sql = @"
+SELECT v AS agent_version, COUNT(*) AS device_count, MAX(last_seen) AS newest_seen
+FROM (SELECT COALESCE(NULLIF(TRIM(agent_version), ''), @u) AS v, last_seen FROM devices) AS g
+GROUP BY v
+ORDER BY device_count DESC, v
+"@
+    $rows = @(Invoke-ScgSql -Path $Path -Sql $sql -Parameter @{ u = 'unknown' })
+    $out = New-Object System.Collections.ArrayList
+    foreach ($row in $rows) {
+        [void]$out.Add([pscustomobject][ordered]@{
+                agent_version = [string]$row.agent_version
+                device_count  = [int]$row.device_count
+                newest_seen   = [string]$row.newest_seen
+            })
+    }
+    return $out.ToArray()
+}
+
+Export-ModuleMember -Function Get-ScgVersionDistribution, Get-ScgIsoOffset, Get-ScgFleetSummary, Get-ScgDeviceAgentSummary, Get-ScgRecentCommand,Initialize-ScgDatabase, Get-ScgSchemaVersion, Invoke-ScgMigration, Invoke-ScgSql, Register-ScgDevice, Update-ScgDeviceSeen, Test-ScgDeviceOnline, Set-ScgDeviceStatus, Set-ScgDeviceToken, Clear-ScgDeviceToken,Sync-ScgScAgent, Get-ScgDevice, Get-ScgScAgent, New-ScgCommand, Get-ScgDispatchableCommand, Get-ScgCommand, Complete-ScgCommand, Invoke-ScgCommandTimeout, Set-ScgStaleDevice, Add-ScgEvent, Get-ScgEvent, Confirm-ScgEvent, Add-ScgAudit, Get-ScgAudit, Get-ScgLastAudit, Get-ScgHealthCounts

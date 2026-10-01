@@ -4,6 +4,23 @@ BeforeAll {
     $env:SCG_ROOT = $TestDrive
     Import-Module (Join-Path $PSScriptRoot '..\..\src\modules\Common.psm1') -Force
     Import-Module (Join-Path $PSScriptRoot '..\..\src\modules\Database.psm1') -Force
+
+    function Add-TestDevice {
+        param([string]$Db, [string]$Id, [string]$Status, [string]$Seen)
+        [void](Invoke-ScgSql -Path $Db -NonQuery -Sql 'INSERT INTO devices (id, hostname, first_seen, last_seen, status) VALUES (@id, @h, @s, @s, @st)' -Parameter @{ id = $Id; h = ('host-' + $Id); s = $Seen; st = $Status })
+    }
+    function Add-TestAgent {
+        param([string]$Db, [string]$Dev, [string]$Id, [int]$Auth, [object]$State)
+        [void](Invoke-ScgSql -Path $Db -NonQuery -Sql 'INSERT INTO sc_agents (id, device_id, authorized, state, first_seen, last_seen) VALUES (@id, @d, @a, @st, @t, @t)' -Parameter @{ id = $Id; d = $Dev; a = $Auth; st = $State; t = '2026-06-15T00:00:00.000Z' })
+    }
+    function Add-TestCommand {
+        param([string]$Db, [string]$Id, [string]$Dev, [string]$Status, [string]$Created, [object]$Finished)
+        [void](Invoke-ScgSql -Path $Db -NonQuery -Sql 'INSERT INTO commands (id, device_id, type, status, created_at, finished_at) VALUES (@id, @d, ''ping'', @st, @c, @f)' -Parameter @{ id = $Id; d = $Dev; st = $Status; c = $Created; f = $Finished })
+    }
+    function Add-TestEvent {
+        param([string]$Db, [string]$Dev, [string]$Sev, [string]$Created, [object]$Acked)
+        [void](Invoke-ScgSql -Path $Db -NonQuery -Sql 'INSERT INTO events (device_id, type, severity, created_at, acked_at) VALUES (@d, ''tamper'', @s, @c, @a)' -Parameter @{ d = $Dev; s = $Sev; c = $Created; a = $Acked })
+    }
 }
 
 Describe 'Database' {
@@ -344,6 +361,213 @@ Describe 'Database' {
             [void](Register-ScgDevice -Path $script:Db -Hostname $evil)
             @(Get-ScgDevice -Path $script:Db -Hostname $evil).Count | Should -Be 1
             @(Invoke-ScgSql -Path $script:Db -Sql 'SELECT * FROM devices').Count | Should -Be 1
+        }
+    }
+
+    Context 'Fleet summaries' {
+        BeforeEach {
+            $script:Now = '2026-06-15T12:00:00.000Z'
+            $script:Recent = '2026-06-15T11:58:00.000Z'
+            $script:Stale = '2026-06-15T11:00:00.000Z'
+            $script:Inside = '2026-06-15T01:00:00.000Z'
+            $script:Outside = '2026-06-13T01:00:00.000Z'
+        }
+
+        It 'empty database returns all zeros as integers' {
+            $s = Get-ScgFleetSummary -Path $script:Db -StaleAfterMin 5 -Now $script:Now
+            $names = 'devices_total', 'devices_online', 'devices_offline', 'devices_quarantined', 'agents_total', 'agents_mine', 'agents_unknown', 'devices_with_unknown', 'commands_pending', 'commands_dispatched', 'commands_failed_24h', 'events_critical_24h', 'events_warn_24h'
+            foreach ($n in $names) {
+                $s.PSObject.Properties[$n] | Should -Not -BeNullOrEmpty
+                $s.$n | Should -BeOfType [int]
+                $s.$n | Should -Be 0
+            }
+            @(Get-ScgDeviceAgentSummary -Path $script:Db -Now $script:Now).Count | Should -Be 0
+        }
+
+        It 'counts a seeded mix correctly' {
+            Add-TestDevice -Db $script:Db -Id 'd1' -Status 'active' -Seen $script:Recent
+            Add-TestDevice -Db $script:Db -Id 'd2' -Status 'active' -Seen $script:Stale
+            Add-TestDevice -Db $script:Db -Id 'd3' -Status 'stale' -Seen $script:Stale
+            Add-TestDevice -Db $script:Db -Id 'd4' -Status 'quarantined' -Seen $script:Recent
+            Add-TestDevice -Db $script:Db -Id 'd5' -Status 'active' -Seen $script:Recent
+            Add-TestAgent -Db $script:Db -Dev 'd1' -Id 'a1' -Auth 1 -State 'Running'
+            Add-TestAgent -Db $script:Db -Dev 'd1' -Id 'a2' -Auth 0 -State 'Running'
+            Add-TestAgent -Db $script:Db -Dev 'd2' -Id 'a3' -Auth 1 -State 'Stopped'
+            Add-TestAgent -Db $script:Db -Dev 'd2' -Id 'a4' -Auth 0 -State $null
+            Add-TestAgent -Db $script:Db -Dev 'd2' -Id 'a5' -Auth 0 -State 'Stopped'
+            Add-TestAgent -Db $script:Db -Dev 'd4' -Id 'a6' -Auth 1 -State $null
+            Add-TestCommand -Db $script:Db -Id 'c1' -Dev 'd1' -Status 'pending' -Created $script:Inside
+            Add-TestCommand -Db $script:Db -Id 'c2' -Dev 'd1' -Status 'dispatched' -Created $script:Inside
+            Add-TestCommand -Db $script:Db -Id 'c3' -Dev 'd2' -Status 'failed' -Created $script:Inside -Finished $script:Inside
+            Add-TestCommand -Db $script:Db -Id 'c4' -Dev 'd2' -Status 'timeout' -Created $script:Inside
+            Add-TestCommand -Db $script:Db -Id 'c5' -Dev 'd2' -Status 'failed' -Created $script:Outside -Finished $script:Outside
+            Add-TestCommand -Db $script:Db -Id 'c6' -Dev 'd1' -Status 'failed' -Created $script:Outside -Finished $script:Inside
+            Add-TestCommand -Db $script:Db -Id 'c7' -Dev 'd1' -Status 'done' -Created $script:Inside -Finished $script:Inside
+            Add-TestCommand -Db $script:Db -Id 'c9' -Dev 'd5' -Status 'failed' -Created $script:Inside -Finished $script:Inside
+            Add-TestEvent -Db $script:Db -Dev 'd1' -Sev 'critical' -Created $script:Inside
+            Add-TestEvent -Db $script:Db -Dev 'd1' -Sev 'critical' -Created $script:Inside
+            Add-TestEvent -Db $script:Db -Dev 'd1' -Sev 'warn' -Created $script:Inside
+            Add-TestEvent -Db $script:Db -Dev 'd1' -Sev 'critical' -Created $script:Inside -Acked $script:Inside
+            Add-TestEvent -Db $script:Db -Dev 'd1' -Sev 'warn' -Created $script:Outside
+            Add-TestEvent -Db $script:Db -Dev 'd1' -Sev 'info' -Created $script:Inside
+
+            $s = Get-ScgFleetSummary -Path $script:Db -StaleAfterMin 5 -Now $script:Now
+            $s.devices_total | Should -Be 5
+            $s.devices_online | Should -Be 2
+            $s.devices_offline | Should -Be 2
+            $s.devices_quarantined | Should -Be 1
+            $s.agents_total | Should -Be 6
+            $s.agents_mine | Should -Be 3
+            $s.agents_unknown | Should -Be 3
+            $s.devices_with_unknown | Should -Be 2
+            $s.commands_pending | Should -Be 1
+            $s.commands_dispatched | Should -Be 1
+            $s.commands_failed_24h | Should -Be 4
+            $s.events_critical_24h | Should -Be 2
+            $s.events_warn_24h | Should -Be 1
+
+            $rows = @(Get-ScgDeviceAgentSummary -Path $script:Db -Now $script:Now)
+            $rows.Count | Should -Be 4
+            $d1 = @($rows | Where-Object { $_.device_id -eq 'd1' })[0]
+            $d1.agents_total | Should -Be 2
+            $d1.agents_mine | Should -Be 1
+            $d1.agents_unknown | Should -Be 1
+            $d1.agents_stopped | Should -Be 0
+            $d1.commands_failed_24h | Should -Be 1
+            $d2 = @($rows | Where-Object { $_.device_id -eq 'd2' })[0]
+            $d2.agents_total | Should -Be 3
+            $d2.agents_mine | Should -Be 1
+            $d2.agents_unknown | Should -Be 2
+            $d2.agents_stopped | Should -Be 1
+            $d2.commands_failed_24h | Should -Be 2
+            $d4 = @($rows | Where-Object { $_.device_id -eq 'd4' })[0]
+            $d4.agents_stopped | Should -Be 0
+            $d5 = @($rows | Where-Object { $_.device_id -eq 'd5' })[0]
+            $d5.agents_total | Should -Be 0
+            $d5.commands_failed_24h | Should -Be 1
+            @($rows | Where-Object { $_.device_id -in 'd3' }).Count | Should -Be 0
+        }
+
+        It 'Get-ScgRecentCommand orders newest first, honours the limit and excludes other devices' {
+            Add-TestDevice -Db $script:Db -Id 'd1' -Status 'active' -Seen $script:Recent
+            Add-TestDevice -Db $script:Db -Id 'd2' -Status 'active' -Seen $script:Recent
+            Add-TestCommand -Db $script:Db -Id 'r1' -Dev 'd1' -Status 'done' -Created '2026-06-15T01:00:00.000Z'
+            Add-TestCommand -Db $script:Db -Id 'r2' -Dev 'd1' -Status 'done' -Created '2026-06-15T02:00:00.000Z'
+            Add-TestCommand -Db $script:Db -Id 'r3' -Dev 'd1' -Status 'done' -Created '2026-06-15T03:00:00.000Z'
+            Add-TestCommand -Db $script:Db -Id 'r4' -Dev 'd1' -Status 'pending' -Created '2026-06-15T04:00:00.000Z'
+            Add-TestCommand -Db $script:Db -Id 'x1' -Dev 'd2' -Status 'pending' -Created '2026-06-15T05:00:00.000Z'
+            $r = @(Get-ScgRecentCommand -Path $script:Db -DeviceId 'd1')
+            $r.Count | Should -Be 3
+            ($r | ForEach-Object { $_.id }) -join ',' | Should -Be 'r4,r3,r2'
+            $r[0].PSObject.Properties['result_json'] | Should -Not -BeNullOrEmpty
+            @(Get-ScgRecentCommand -Path $script:Db -DeviceId 'd1' -Last 10).Count | Should -Be 4
+            @(Get-ScgRecentCommand -Path $script:Db -DeviceId 'd1' -Last 1).Count | Should -Be 1
+            @(Get-ScgRecentCommand -Path $script:Db -DeviceId 'none').Count | Should -Be 0
+            { Get-ScgRecentCommand -Path $script:Db -DeviceId 'd1' -Last 21 } | Should -Throw
+        }
+
+        It 'a 500 device seed finishes under 5 seconds' {
+            $t = $script:Recent
+            $cte = 'WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<500) '
+            [void](Invoke-ScgSql -Path $script:Db -NonQuery -Parameter @{ t = $t } -Sql ($cte + "INSERT INTO devices (id, hostname, first_seen, last_seen, status) SELECT printf('dev%04d', i), printf('host%04d', i), @t, @t, 'active' FROM n"))
+            [void](Invoke-ScgSql -Path $script:Db -NonQuery -Parameter @{ t = $t } -Sql ($cte + "INSERT INTO sc_agents (id, device_id, authorized, state, first_seen, last_seen) SELECT printf('ag%04d_%d', i, k), printf('dev%04d', i), k - 1, 'Running', @t, @t FROM n CROSS JOIN (SELECT 1 AS k UNION SELECT 2) AS ks"))
+            [void](Invoke-ScgSql -Path $script:Db -NonQuery -Parameter @{ t = $t } -Sql ($cte + "INSERT INTO commands (id, device_id, type, status, created_at, finished_at) SELECT printf('cm%04d', i), printf('dev%04d', i), 'ping', 'failed', @t, @t FROM n"))
+            $sw = [System.Diagnostics.Stopwatch]::StartNew()
+            $s = Get-ScgFleetSummary -Path $script:Db -StaleAfterMin 5 -Now $script:Now
+            $rows = @(Get-ScgDeviceAgentSummary -Path $script:Db -Now $script:Now)
+            $sw.Stop()
+            $sw.ElapsedMilliseconds | Should -BeLessThan 5000
+            $s.devices_total | Should -Be 500
+            $s.devices_online | Should -Be 500
+            $s.agents_total | Should -Be 1000
+            $s.commands_failed_24h | Should -Be 500
+            $rows.Count | Should -Be 500
+            $rows[0].agents_total | Should -Be 2
+        }
+    }
+
+    Context 'Update command payload' {
+        BeforeEach {
+            $script:Dev = Register-ScgDevice -Path $script:Db -Hostname 'PC1'
+            $script:Sha = 'ab' * 32
+            $script:Url = 'https://github.com/cBadr/SCGuardian/releases/download/v4.0.2/SCGuardian.Agent.Setup.exe'
+        }
+        It 'accepts an update command with a valid payload and round-trips the exact payload' {
+            $json = '{"version":"4.0.2","setup_url":"' + $script:Url + '","sha256":"' + $script:Sha + '"}'
+            $id = New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload $json -IssuedBy 'telegram:1' -IssuedVia telegram
+            $id | Should -Not -BeNullOrEmpty
+            $c = Get-ScgCommand -Path $script:Db -CommandId $id -DeviceId $script:Dev.id
+            $c.type | Should -Be 'update'
+            $c.status | Should -Be 'pending'
+            $c.payload_json | Should -BeExactly $json
+        }
+        It 'accepts a hashtable payload on the release asset CDN and stores its fields' {
+            $cdn = 'https://objects.githubusercontent.com/github-production-release-asset/1/abc?x=1'
+            $id = New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = $cdn; sha256 = $script:Sha }
+            $p = ConvertFrom-Json -InputObject (Get-ScgCommand -Path $script:Db -CommandId $id).payload_json
+            $p.version | Should -BeExactly '4.0.2'
+            $p.setup_url | Should -BeExactly $cdn
+            $p.sha256 | Should -BeExactly $script:Sha
+        }
+        It 'accepts a githubusercontent.com subdomain' {
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = 'https://release-assets.githubusercontent.com/a/b.exe'; sha256 = $script:Sha } } | Should -Not -Throw
+        }
+        It 'rejects an http url naming setup_url' {
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = 'http://github.com/a/b.exe'; sha256 = $script:Sha } } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*setup_url*'
+        }
+        It 'rejects a non-github host' {
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = 'https://evil.example.com/b.exe'; sha256 = $script:Sha } } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*setup_url*'
+        }
+        It 'rejects github.com lookalike hosts and userinfo tricks' {
+            foreach ($bad in @('https://github.com.evil.com/b.exe', 'https://evilgithub.com/b.exe', 'https://evilgithubusercontent.com/b.exe', 'https://githubusercontent.com.evil.com/b.exe', 'https://github.com@evil.com/b.exe', 'https://github.com./b.exe', 'not a url', '')) {
+                { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = $bad; sha256 = $script:Sha } } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*setup_url*'
+            }
+        }
+        It 'rejects a short, uppercase or non-hex sha256' {
+            foreach ($bad in @(('ab' * 31), ('AB' * 32), (('ab' * 31) + 'zz'), (('ab' * 32) + 'a'), (('ab' * 32) + "`n"))) {
+                { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = $script:Url; sha256 = $bad } } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*sha256*'
+            }
+        }
+        It 'rejects a missing or empty version' {
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ setup_url = $script:Url; sha256 = $script:Sha } } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*version*'
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = ' '; setup_url = $script:Url; sha256 = $script:Sha } } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*version*'
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload $null } | Should -Throw -ExceptionType ([System.ArgumentException]) -ExpectedMessage '*version*'
+        }
+        It 'never inserts a row when validation fails' {
+            { New-ScgCommand -Path $script:Db -DeviceId $script:Dev.id -Type update -Payload @{ version = '4.0.2'; setup_url = 'https://github.com.evil.com/b.exe'; sha256 = $script:Sha } } | Should -Throw
+            @(Invoke-ScgSql -Path $script:Db -Sql 'SELECT id FROM commands').Count | Should -Be 0
+        }
+    }
+
+    Context 'Version distribution' {
+        It 'returns an empty result for an empty devices table' {
+            $r = @(Get-ScgVersionDistribution -Path $script:Db)
+            $r.Count | Should -Be 0
+        }
+        It 'groups by agent_version with unknown for NULL or empty, ordered by count then version' {
+            $seed = @(
+                @('d1', '4.0.1', '2026-06-10T00:00:00.000Z'),
+                @('d2', '4.0.1', '2026-06-12T00:00:00.000Z'),
+                @('d3', '4.0.1', '2026-06-11T00:00:00.000Z'),
+                @('d4', '4.0.0', '2026-06-09T00:00:00.000Z'),
+                @('d5', $null, '2026-06-13T00:00:00.000Z'),
+                @('d6', '', '2026-06-08T00:00:00.000Z'),
+                @('d7', '3.9.0', '2026-06-14T00:00:00.000Z')
+            )
+            foreach ($s in $seed) {
+                [void](Invoke-ScgSql -Path $script:Db -NonQuery -Sql "INSERT INTO devices (id, hostname, first_seen, last_seen, status, agent_version) VALUES (@id, @h, @t, @t, 'active', @av)" -Parameter @{ id = $s[0]; h = ('host-' + $s[0]); t = $s[2]; av = $s[1] })
+            }
+            $r = @(Get-ScgVersionDistribution -Path $script:Db)
+            $r.Count | Should -Be 4
+            ($r | ForEach-Object { $_.agent_version }) -join ',' | Should -BeExactly '4.0.1,unknown,3.9.0,4.0.0'
+            $r[0].device_count | Should -Be 3
+            $r[0].newest_seen | Should -BeExactly '2026-06-12T00:00:00.000Z'
+            $r[1].device_count | Should -Be 2
+            $r[1].newest_seen | Should -BeExactly '2026-06-13T00:00:00.000Z'
+            $r[2].device_count | Should -Be 1
+            $r[2].newest_seen | Should -BeExactly '2026-06-14T00:00:00.000Z'
+            $r[3].device_count | Should -Be 1
+            $r[3].newest_seen | Should -BeExactly '2026-06-09T00:00:00.000Z'
         }
     }
 }

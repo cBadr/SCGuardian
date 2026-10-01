@@ -14,7 +14,7 @@ Source of truth for every name used in code, DB, API and config.
 | Name | Values |
 |---|---|
 | device.status | `active` `stale` `quarantined` |
-| command.type | `harden` `restore` `remove` `status` `agents` `ping` |
+| command.type | `harden` `restore` `remove` `status` `agents` `ping` `update` (v2.2, see self-update.md) |
 | command.status | `pending` `dispatched` `done` `failed` `timeout` |
 | command transitions | pending→dispatched→(done\|failed\|timeout); pending→timeout. No other moves. |
 | command.issued_via | `telegram` `system` |
@@ -65,8 +65,8 @@ Goal: a stolen fleet-wide shared secret can no longer impersonate an existing de
 - HttpServer: handlers receive `$Request.Headers` (case-insensitive hashtable, at least `X-SCG-Device-Token`) in addition to Method/Path/Body/RemoteIp. The shared-secret/replay pipeline order is unchanged; device-token checks happen inside the Hub handlers.
 - New audit action: `device.reset`.
 
-## Command payload (v1.2, FROZEN)
-`commands.payload_json` is a JSON object. Only key defined: `sc_id` (16-hex, lowercase) — the ScreenConnect instance targeted by `remove` (mandatory), `harden` and `restore` (optional: absent = all allow-listed agents on the device). `status`/`agents`/`ping`: `{}`. Producers (Telegram) and consumers (Agent) MUST use `sc_id`; the key `id` is NOT part of the contract.
+## Command payload (v1.2 + v2.2, FROZEN)
+`commands.payload_json` is a JSON object. Key defined: `sc_id` (16-hex, lowercase) — the ScreenConnect instance targeted by `remove` (mandatory), `harden` and `restore` (optional: absent = all allow-listed agents on the device). `status`/`agents`/`ping`: `{}`. `update` (v2.2): `{version, setup_url, sha256}` — see self-update.md for full validation rules (New-ScgCommand rejects a malformed `update` payload before it reaches the queue). Producers (Telegram) and consumers (Agent) MUST use `sc_id`; the key `id` is NOT part of the contract.
 Agent result for `remove`: a result string starting `refused:` or `aborted:` means `ok=false` (nothing was removed).
 
 ## Event payload (v1.2)
@@ -79,5 +79,5 @@ Hub `defaults.tick_sec` (30) · `defaults.telegram_error_pause_sec` (5) · `defa
 `Authorization: Bearer <secret>` · `X-SCG-Timestamp` (UTC ISO8601) · `X-SCG-Nonce` (GUID)
 
 ## Telegram callback_data grammar (≤64 bytes)
-`m:main|devs|fleet|events|audit|help` · `d:<device_id8>` · `a:<status|harden|restore|agents|listrm>:<device_id8>` · `rm:<device_id8>:<sc_id>` · `rmc:<device_id8>:<sc_id>` · `pg:<n>`
+`m:main|devs|fleet|events|audit|help` · `d:<device_id8>` · `a:<status|harden|restore|agents|listrm>:<device_id8>` · `rm:<device_id8>:<sc_id>` · `rmc:<device_id8>:<sc_id>` · `pg:<n>` · `up:ok|no:<token8>` (v2.2, self-update.md)
 (`device_id8` = first 8 chars of device GUID; resolved by prefix, must be unique.)

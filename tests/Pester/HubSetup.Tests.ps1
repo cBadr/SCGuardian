@@ -4,6 +4,7 @@ BeforeAll {
     $script:RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     $script:SetupScript = Join-Path $script:RepoRoot 'hub-deploy\Setup-Hub.ps1'
     $script:TemplateScript = Join-Path $script:RepoRoot 'hub-deploy\agent-bootstrap.template.ps1'
+    $script:CmdTemplate = Join-Path $script:RepoRoot 'hub-deploy\agent-bootstrap.cmd.template'
     $script:ConfigTemplate = Join-Path $script:RepoRoot 'src\config\hub.config.template.json'
 
     function script:Get-Ast([string]$Path) {
@@ -61,6 +62,29 @@ Describe 'Script hygiene' {
     }
     It 'Setup-Hub guards execution when dot-sourced' {
         (Get-Content -LiteralPath $script:SetupScript -Raw) | Should -Match ([regex]::Escape("if (`$MyInvocation.InvocationName -eq '.') { return }"))
+    }
+    It 'the bootstrap template self-elevates and never bypasses the admin check' {
+        $text = Get-Content -LiteralPath $script:TemplateScript -Raw
+        $text | Should -Match '(?i)Test-IsAdministrator'
+        $text | Should -Match '(?i)-Verb\s+RunAs'
+        $text | Should -Match '(?i)\[switch\]\$Elevated'
+    }
+    It 'the cmd launcher exists, is plain ASCII batch and runs the ps1 unattended' {
+        Test-Path -LiteralPath $script:CmdTemplate -PathType Leaf | Should -BeTrue
+        $bytes = [IO.File]::ReadAllBytes($script:CmdTemplate)
+        # no UTF-8/UTF-16 BOM: a BOM at the top of a .cmd file can corrupt the first command on some cmd.exe builds
+        ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeFalse
+        $text = [IO.File]::ReadAllText($script:CmdTemplate)
+        $text | Should -Match '(?i)^@echo off'
+        $text | Should -Match '(?i)agent-bootstrap\.ps1'
+        $text | Should -Match '(?i)-ExecutionPolicy\s+Bypass'
+        $text | Should -Not -Match '\{\{'
+    }
+    It 'Setup-Hub writes both the ps1 and the cmd launcher, and copies both to Desktop' {
+        $text = Get-Content -LiteralPath $script:SetupScript -Raw
+        $text | Should -Match 'CmdBootstrapPath'
+        $text | Should -Match "'agent-bootstrap\.cmd'"
+        $text | Should -Match 'agent-bootstrap\.cmd\.template'
     }
 }
 

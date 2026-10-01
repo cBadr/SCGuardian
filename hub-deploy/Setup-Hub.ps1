@@ -526,6 +526,7 @@ $InstallDir = 'C:\Program Files\SCGuardian'
 $DataDir = 'C:\ProgramData\SCGuardian'
 $ConfigPath = Join-Path $DataDir 'hub.config.json'
 $BootstrapPath = Join-Path $DataDir 'agent-bootstrap.ps1'
+$CmdBootstrapPath = Join-Path $DataDir 'agent-bootstrap.cmd'
 $HubUrl = 'https://{0}:{1}' -f $Domain, $Port
 $knownSecrets = @()
 
@@ -685,7 +686,7 @@ try {
     }
 
     Write-Step 8 'Generating the agent bootstrap'
-    if ($dry) { Write-Host "      WhatIf: would write $BootstrapPath$(if ($Desktop) { ' and a Desktop copy' })." }
+    if ($dry) { Write-Host "      WhatIf: would write $BootstrapPath and $CmdBootstrapPath$(if ($Desktop) { ' and Desktop copies' })." }
     else {
         $sumsUrl = '{0}/releases/download/v{1}/SHA256SUMS.txt' -f $script:RepoUrl, $Version
         $sumsFile = Join-Path $env:TEMP ('scg-sums-' + $Version + '.txt')
@@ -714,12 +715,34 @@ try {
             Set-LockedFileAcl -Path $BootstrapPath
             Write-Host "      Wrote $BootstrapPath (SYSTEM and Administrators only)."
         }
+
+        # Static double-click launcher (no placeholders to render): runs the .ps1 above, which
+        # requests elevation itself. Lets the operator just double-click one file on the device.
+        $cmdTemplatePath = $null
+        $cmdCandidates = @()
+        if ($root) { $cmdCandidates += (Join-Path $root 'hub-deploy\agent-bootstrap.cmd.template') }
+        if ($selfDir) { $cmdCandidates += (Join-Path $selfDir 'agent-bootstrap.cmd.template') }
+        foreach ($c in $cmdCandidates) { if (Test-Path -LiteralPath $c -PathType Leaf) { $cmdTemplatePath = $c; break } }
+        if ($cmdTemplatePath) { $cmdContent = [IO.File]::ReadAllText($cmdTemplatePath) }
+        else {
+            $cmdContent = (Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/cBadr/SCGuardian/main/hub-deploy/agent-bootstrap.cmd.template' -UseBasicParsing).Content
+            if ($cmdContent -is [byte[]]) { $cmdContent = [Text.Encoding]::UTF8.GetString($cmdContent) }
+        }
+        if ($PSCmdlet.ShouldProcess($CmdBootstrapPath, 'Write agent bootstrap launcher (.cmd)')) {
+            [IO.File]::WriteAllText($CmdBootstrapPath, $cmdContent, [Text.Encoding]::ASCII)
+            Set-LockedFileAcl -Path $CmdBootstrapPath
+            Write-Host "      Wrote $CmdBootstrapPath (double-click launcher, SYSTEM and Administrators only)."
+        }
+
         if ($Desktop) {
             $desktopCopy = Join-Path ([Environment]::GetFolderPath('Desktop')) 'agent-bootstrap.ps1'
+            $desktopCmdCopy = Join-Path ([Environment]::GetFolderPath('Desktop')) 'agent-bootstrap.cmd'
             if ($PSCmdlet.ShouldProcess($desktopCopy, 'Copy agent bootstrap to Desktop')) {
                 Copy-Item -LiteralPath $BootstrapPath -Destination $desktopCopy -Force
                 Set-LockedFileAcl -Path $desktopCopy
-                Write-Host "      Copied to $desktopCopy"
+                Copy-Item -LiteralPath $CmdBootstrapPath -Destination $desktopCmdCopy -Force
+                Set-LockedFileAcl -Path $desktopCmdCopy
+                Write-Host "      Copied to $desktopCopy and $desktopCmdCopy"
             }
         }
     }
@@ -734,14 +757,17 @@ Write-Host '================ SCGuardian Hub ready ================' -ForegroundC
 Write-Host "Hub URL        : $HubUrl"
 Write-Host "Thumbprint     : $(if ($thumb) { $thumb } else { '(WhatIf)' })"
 Write-Host "Agent bootstrap: $BootstrapPath"
+Write-Host "Launcher       : $CmdBootstrapPath"
 Write-Host ''
 Write-Host 'Next steps:'
 Write-Host "  1. DNS: an A record for $Domain must point to this server's public IP."
 Write-Host "  2. Open inbound TCP $Port on the router/cloud firewall (Windows Firewall rule '$RuleName' is already set)."
-Write-Host '  3. Copy agent-bootstrap.ps1 to each device over a PRIVATE channel and run it as Administrator:'
-Write-Host '       powershell -NoProfile -ExecutionPolicy Bypass -File .\agent-bootstrap.ps1'
-Write-Host '     Delete it from the device afterwards.'
-Write-Host '  WARNING: agent-bootstrap.ps1 contains the shared secret. Per-device tokens limit what a leaked'
+Write-Host '  3. Copy BOTH agent-bootstrap.ps1 and agent-bootstrap.cmd to each device (same folder) over a'
+Write-Host '     PRIVATE channel, then just double-click agent-bootstrap.cmd. It asks for Administrator rights'
+Write-Host '     once (UAC) and installs and enrolls silently - no typing required. (Or run the .ps1 directly'
+Write-Host '     from an elevated prompt: powershell -NoProfile -ExecutionPolicy Bypass -File .\agent-bootstrap.ps1)'
+Write-Host '     Delete both files from the device afterwards.'
+Write-Host '  WARNING: agent-bootstrap.ps1/.cmd contain the shared secret. Per-device tokens limit what a leaked'
 Write-Host '  secret can do to enrolled devices, but it can still enroll NEW hostnames. If it leaks, clear'
 Write-Host '  shared_secret in hub.config.json, re-run this command and redeploy the new bootstrap.'
 Write-Host '  Re-enroll a device (reinstalled or rebuilt with the same hostname): send /reset <hostname> to the'

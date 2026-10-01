@@ -29,7 +29,7 @@ Defaults: `-Domain ostazna.pro -Port 8443 -Version 4.0.1`. The script prints num
 | 5 | Certificate: reuses the pinned certificate if it is valid (re-runs never change the thumbprint), otherwise creates a self-signed one with `cert-setup.ps1 -SelfSigned` |
 | 6 | Restarts `SCGuardian-Hub` and waits up to 30 s for the port |
 | 7 | Signed health check on `https://localhost:<Port>/api/v1/health`, certificate pinned by thumbprint; on failure it prints the last 15 log lines (secrets masked) and exits 1 |
-| 8 | Writes `C:\ProgramData\SCGuardian\agent-bootstrap.ps1` (SYSTEM + Administrators only) |
+| 8 | Writes `C:\ProgramData\SCGuardian\agent-bootstrap.ps1` and the double-click launcher `agent-bootstrap.cmd` (SYSTEM + Administrators only) |
 
 Flags:
 
@@ -39,7 +39,7 @@ Flags:
 | `-NewCert` | Forces a new self-signed certificate. Every agent then needs the regenerated bootstrap |
 | `-WhatIf` | Shows every change without making it |
 | `-SkipHealthCheck` | Skips step 7 |
-| `-Desktop` | Also copies `agent-bootstrap.ps1` to your Desktop |
+| `-Desktop` | Also copies `agent-bootstrap.ps1` and `agent-bootstrap.cmd` to your Desktop |
 
 The command is safe to re-run (for example after a failed step or to regenerate the bootstrap).
 
@@ -47,15 +47,17 @@ The command is safe to re-run (for example after a failed step or to regenerate 
 
 `agent-bootstrap.ps1` is rendered from `agent-bootstrap.template.ps1` with this Hub's URL, shared secret,
 certificate thumbprint, version and the SHA-256 of `SCGuardian.Agent.Setup.exe` (read from the release
-`SHA256SUMS.txt`). Copy it to each device over a **private channel** and run as Administrator:
+`SHA256SUMS.txt`). `agent-bootstrap.cmd` is a static launcher copied next to it unchanged.
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .\agent-bootstrap.ps1
-```
+Copy **both files, in the same folder**, to each device over a **private channel**, then just
+double-click `agent-bootstrap.cmd`. It asks for Administrator rights once (a single UAC prompt) and
+then installs and enrolls completely silently - no console, no typing. (Running the `.ps1` directly
+from an already-elevated prompt also still works: `powershell -NoProfile -ExecutionPolicy Bypass -File
+.\agent-bootstrap.ps1`.)
 
 It downloads the agent setup, verifies the SHA-256 (aborts and deletes on mismatch), installs silently,
 checks the `SCGuardian-Agent` task and waits up to 60 s for enrollment (exit 0 enrolled, 1 failed,
-2 installed but not enrolled yet). Delete the file afterwards.
+2 installed but not enrolled yet). Delete both files from the device afterwards.
 
 > **The bootstrap contains the shared secret.** Per-device tokens limit what a leaked secret can do to
 > enrolled devices, but it can still enroll **new** hostnames. If it leaks: clear `shared_secret` in

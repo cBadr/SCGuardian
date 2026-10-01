@@ -1,0 +1,7 @@
+@echo off
+rem SCGuardian agent bootstrap launcher. Double-click this file.
+rem It runs agent-bootstrap.ps1, which requests Administrator rights itself (one UAC prompt)
+rem and then installs and enrolls the agent silently - no further input is needed.
+rem Delete both files from this device when enrollment is confirmed: they contain the Hub shared secret.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0agent-bootstrap.ps1"
+exit /b %errorlevel%

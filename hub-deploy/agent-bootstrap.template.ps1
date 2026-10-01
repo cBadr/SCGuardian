@@ -8,11 +8,16 @@
     SHA-256, run it silently, confirm the SCGuardian-Agent task, then wait up to 60 seconds for enrollment.
     The secret and the device token are never printed. Exit codes: 0 enrolled, 1 failure, 2 installed but
     not yet enrolled.
+    Not elevated? It relaunches itself with a UAC prompt (one click), so double-clicking the sibling
+    agent-bootstrap.cmd works without opening PowerShell manually.
 .EXAMPLE
     powershell -NoProfile -ExecutionPolicy Bypass -File .\agent-bootstrap.ps1
 #>
 [CmdletBinding()]
-param()
+param(
+    # Internal: set by the self-elevation relaunch so the elevated copy does not re-elevate itself again.
+    [switch]$Elevated
+)
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -61,15 +66,46 @@ function Test-HubReachable {
     finally { $client.Close() }
 }
 
+function Exit-Bootstrap {
+    <#
+    .SYNOPSIS
+        Exits with the given code. Pauses first when this is the elevated, double-click-launched
+        window (so the result is readable before the window closes); a direct, already-elevated
+        run from an existing prompt does not pause.
+    #>
+    param([int]$Code)
+    if ($Elevated) { Write-Host ''; Read-Host 'Press Enter to close' | Out-Null }
+    exit $Code
+}
+
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 if ($HubUrl -notmatch '^https://') {
     Write-Host 'This is the unrendered template. Run hub-deploy\Setup-Hub.ps1 on the Hub to generate agent-bootstrap.ps1.' -ForegroundColor Red
-    exit 1
+    Exit-Bootstrap -Code 1
 }
 if (-not (Test-IsAdministrator)) {
-    Write-Host 'Run this script from an elevated (Administrator) PowerShell prompt.' -ForegroundColor Red
-    exit 1
+    if ($Elevated) {
+        # Already relaunched once and still not admin (elevation declined) - do not loop forever.
+        Write-Host 'Administrator rights are required. The elevation prompt was declined or failed.' -ForegroundColor Red
+        Exit-Bootstrap -Code 1
+    }
+    Write-Host 'Requesting Administrator rights (one UAC prompt)...' -ForegroundColor Yellow
+    $selfPath = $PSCommandPath
+    if (-not $selfPath) { $selfPath = $MyInvocation.MyCommand.Path }
+    if (-not $selfPath) {
+        Write-Host 'Cannot locate this script to relaunch elevated. Right-click PowerShell, choose Run as Administrator, then run this script again.' -ForegroundColor Red
+        exit 1
+    }
+    try {
+        $elevatedArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $selfPath + '"'), '-Elevated')
+        $proc = Start-Process -FilePath 'powershell.exe' -ArgumentList $elevatedArgs -Verb RunAs -Wait -PassThru
+        exit $proc.ExitCode
+    }
+    catch {
+        Write-Host 'Elevation was declined or failed. Right-click PowerShell, choose Run as Administrator, then run this script again.' -ForegroundColor Red
+        exit 1
+    }
 }
 [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
 
@@ -98,7 +134,7 @@ try {
 }
 catch {
     Write-Host ('FAILED: ' + $_.Exception.Message) -ForegroundColor Red
-    exit 1
+    Exit-Bootstrap -Code 1
 }
 finally {
     Remove-Item -LiteralPath $SetupPath -Force -ErrorAction SilentlyContinue
@@ -109,7 +145,7 @@ Write-Step 4 ('Checking scheduled task ' + $TaskName)
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($null -eq $task) {
     Write-Host ('FAILED: scheduled task ' + $TaskName + ' was not created.') -ForegroundColor Red
-    exit 1
+    Exit-Bootstrap -Code 1
 }
 $state = [string]$task.State
 if ($state -eq 'Ready' -or $state -eq 'Running') { Write-Host ('      Task state: ' + $state) }
@@ -126,7 +162,7 @@ while ((Get-Date) -lt $deadline) {
 if ($enrolled) {
     Write-Host ('Enrolled: ' + $env:COMPUTERNAME + ' is registered with the Hub.') -ForegroundColor Green
     Write-Host 'Delete this bootstrap file now: it contains the Hub shared secret.'
-    exit 0
+    Exit-Bootstrap -Code 0
 }
 
 $uri = [Uri]$HubUrl
@@ -137,4 +173,4 @@ else {
     Write-Warning ('Not enrolled within 60 seconds although the Hub is reachable. If the hostname ' + $env:COMPUTERNAME + ' was enrolled before (reinstall or rebuilt machine), ask the Hub admin to send /reset ' + $env:COMPUTERNAME + ' to the Telegram bot; the agent re-enrolls on its next cycle. If the Hub certificate changed, regenerate this file with Setup-Hub.ps1. Logs: C:\ProgramData\SCGuardian.')
 }
 Write-Host 'Delete this bootstrap file when done: it contains the Hub shared secret.'
-exit 2
+Exit-Bootstrap -Code 2
